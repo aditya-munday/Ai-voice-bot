@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Voice Assistant</title>
+    <meta name="theme-color" content="#0b0d12" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <p class="status" id="status" data-tone="idle">Ready — hold to talk</p>
+
+      <button class="talk" id="talk" data-state="idle" type="button" aria-label="Push to talk">
+        <span class="ring"></span>
+        <span class="core">Talk</span>
+      </button>
+
+      <div class="meter" id="meter" aria-hidden="true"></div>
+
+      <section class="log">
+        <p class="transcript" id="transcript"></p>
+        <p class="answer" id="answer"></p>
+      </section>
+
+      <p class="hint">Hold the button, or hold <kbd>Space</kbd>.</p>
+    </main>
+
+    <script src="/main.js" type="module"></script>
+  </body>
+</html>

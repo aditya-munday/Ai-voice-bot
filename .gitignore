@@ -1,0 +1,10 @@
+node_modules/
+dist/
+public/main.js
+public/main.js.map
+public/pcm-worklet.js
+public/pcm-worklet.js.map
+.env
+.env.local
+*.log
+.DS_Store

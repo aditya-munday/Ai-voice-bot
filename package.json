@@ -1,0 +1,28 @@
+{
+  "name": "voice-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Push-to-talk voice assistant: smallest.ai STT -> Groq LLM -> smallest.ai TTS",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node dist/server.js",
+    "dev": "node scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "esbuild@0.24.2": true
+  }
+}

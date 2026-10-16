@@ -1,0 +1,174 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d12;
+  --panel: #141821;
+  --line: #232a38;
+  --text: #e8ecf4;
+  --muted: #7d879c;
+  --accent: #4f8cff;
+  --accent-live: #ff5d5d;
+  --accent-think: #ffc14d;
+  --accent-speak: #3ddc97;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: radial-gradient(120% 120% at 50% 0%, #131a28 0%, var(--bg) 60%);
+  color: var(--text);
+  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, system-ui, sans-serif;
+  display: grid;
+  place-items: center;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+.app {
+  width: min(560px, 92vw);
+  display: grid;
+  justify-items: center;
+  gap: 22px;
+  padding: 40px 0;
+}
+
+.status {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0.01em;
+  color: var(--muted);
+  min-height: 1.5em;
+  transition: color 0.18s ease;
+}
+
+.status[data-tone="live"] {
+  color: var(--accent-live);
+}
+.status[data-tone="think"] {
+  color: var(--accent-think);
+}
+.status[data-tone="speak"] {
+  color: var(--accent-speak);
+}
+.status[data-tone="bad"] {
+  color: var(--accent-live);
+}
+
+.talk {
+  position: relative;
+  width: 168px;
+  height: 168px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  outline: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.talk .ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  background: linear-gradient(180deg, #1b2130 0%, #11151e 100%);
+  transition: border-color 0.2s ease, transform 0.12s ease, box-shadow 0.2s ease;
+}
+
+.talk .core {
+  position: relative;
+  font-weight: 600;
+  font-size: 18px;
+  letter-spacing: 0.02em;
+}
+
+.talk:hover .ring {
+  border-color: #3a465e;
+}
+
+.talk[data-state="starting"] .ring,
+.talk[data-state="recording"] .ring {
+  border-color: var(--accent-live);
+  transform: scale(calc(1 + var(--level, 0) * 0.06));
+  box-shadow: 0 0 calc(18px + var(--level, 0) * 60px) rgba(255, 93, 93, 0.35);
+}
+
+.talk[data-state="starting"] .core,
+.talk[data-state="recording"] .core {
+  color: var(--accent-live);
+}
+
+.meter {
+  width: 180px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.meter::after {
+  content: "";
+  display: block;
+  height: 100%;
+  width: calc(var(--level, 0) * 100%);
+  background: var(--accent-live);
+  transition: width 0.08s linear;
+}
+
+.log {
+  width: 100%;
+  min-height: 96px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  padding: 16px 18px;
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.transcript,
+.answer {
+  margin: 0;
+}
+
+.transcript {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.transcript:empty,
+.answer:empty {
+  display: none;
+}
+
+.answer {
+  white-space: pre-wrap;
+}
+
+.hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+kbd {
+  font: inherit;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 1px 6px;
+  background: #0e1219;
+}
