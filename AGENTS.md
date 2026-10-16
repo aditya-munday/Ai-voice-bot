@@ -64,7 +64,17 @@ All source is TypeScript.
     whole word. Committing on a short fixed timer instead races that flush and
     non-deterministically drops the segment after the pause, so the model answers
     only the first half of the question. See `finalize()` in `recorder.ts`.
+  - The provider drops the last word when the audio stops dead on it, so a turn
+    ends with ~420 ms of silence padded onto the socket before `finalize`. See
+    `padSilence()` in `recorder.ts` and `scripts/probe-stt-tail.mjs`.
   - Not every pause splits a segment, so a dropped tail looks intermittent.
+- The first press is slower than later ones: it opens the mic and fetches and
+  compiles the worklet. `recorder.preload()` starts the worklet at page load, and
+  `ensureStream()` shares one `getUserMedia` between `prime()` and `start()` —
+  both run on the same first gesture, and two calls mean two prompts. A release
+  that lands while the graph is still being built cancels the start via the `turn`
+  counter; `stop()` must not be gated on `recording` or that release is dropped
+  and the microphone stays open.
 - Groq model availability is account-specific. `openai/gpt-oss-20b` is the fast
   default here; `llama-3.1-8b-instant` is not enabled on every account.
 

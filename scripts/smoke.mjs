@@ -115,7 +115,7 @@ async function testStt() {
   ws.on('message', (raw) => {
     const m = JSON.parse(raw.toString());
     if (m.type === 'ready') ready = true;
-    if (m.type === 'transcript' && m.final) finals.push(m.text);
+    if (m.type === 'transcript' && m.final) finals.push({ text: m.text, at: Date.now() });
   });
   await new Promise((r) => ws.on('open', r));
   for (let i = 0; i < 100 && !ready; i++) await sleep(50);
@@ -126,11 +126,34 @@ async function testStt() {
     ws.send(pcm.subarray(i, i + 4096));
     await sleep(55);
   }
+  const finalizeAt = Date.now();
+  // The provider drops the last word if the audio stops dead on it, so end the
+  // utterance with trailing silence the way a real microphone does. Measured:
+  // no silence loses the tail in ~25% of runs, 400ms recovers it every time.
+  ws.send(Buffer.alloc(16000 * 2 * 0.42));
   ws.send(JSON.stringify({ type: 'finalize' }));
-  for (let i = 0; i < 40 && finals.length === 0; i++) await sleep(100);
+  // The provider closes a segment on any pause, so a phrase can arrive as several
+  // finals and the last one is not necessarily the first to land. Wait for the
+  // flush that `finalize` triggers, or for a quiet gap if the provider had
+  // already ended the utterance by itself; stopping at the first final loses the
+  // word after a pause.
+  // The provider closes a segment on any pause, so a phrase can arrive as several
+  // finals and the last one is not necessarily the first to land. Wait for the
+  // flush that `finalize` triggers, or for a quiet gap if the provider had
+  // already ended the utterance by itself; stopping at the first final loses the
+  // word after a pause.
+  for (let i = 0; i < 60; i++) {
+    await sleep(100);
+    const last = finals[finals.length - 1];
+    if (last && last.at >= finalizeAt) break;
+    if (last && Date.now() - last.at > 800) break;
+  }
   ws.close();
 
-  const transcript = finals.join(' ').toLowerCase();
+  const transcript = finals
+    .map((f) => f.text)
+    .join(' ')
+    .toLowerCase();
   check('stt: ready handshake', ready);
   // STT may render the numerals ("2 plus 2") or spell them out; both are correct.
   check(

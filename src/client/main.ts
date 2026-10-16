@@ -48,7 +48,10 @@ const startListening = (): void => {
 };
 
 const stopListening = (): void => {
-  if (phase !== 'recording') return;
+  // Not gated on `recording`: the first press spends time opening the microphone
+  // and building the capture graph, and a release during that window must still
+  // end the turn. The recorder records the release and closes it when the graph
+  // is live, so the button always responds.
   recorder.stop();
 };
 
@@ -128,6 +131,10 @@ assistant.errors.on(showError);
 /* ------------------------------------------------ *
  * Warm start
  * ------------------------------------------------ */
+// The worklet needs no user gesture, so its fetch and compile start now. It is
+// the slowest step of the first press, and the press should not pay for it.
+recorder.preload();
+
 // The first gesture is the only chance to unlock audio and grant the mic, so
 // use it to open every connection the assistant will need. After this, a turn
 // costs no setup at all.

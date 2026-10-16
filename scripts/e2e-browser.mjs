@@ -360,7 +360,9 @@ await evaluate(`(() => {
   };
 })()`);
 
-const wordsOf = (p) => (Array.isArray(p) ? p.join(' ') : p).toLowerCase().match(/[a-z]+/g) ?? [];
+// Digits count as words: the recognizer renders numbers as numerals ("Times 3"),
+// so a letters-only split would silently drop them and under-count the phrase.
+const wordsOf = (p) => (Array.isArray(p) ? p.join(' ') : p).toLowerCase().match(/[a-z0-9]+/g) ?? [];
 const turns = [{ label: 'turn 1', b64: wavB64, hold: 3800, spoken: wordsOf(PHRASE), phrase: PHRASE }];
 if (TURN_2) turns.push({ label: 'turn 2', b64: wav2B64, hold: 3800, spoken: wordsOf(TURN_2), phrase: TURN_2 });
 
@@ -392,7 +394,7 @@ for (const turn of turns) {
   // pause, and committing before it flushes loses the word after the pause.
   // Spelling is not asserted — the recognizer legitimately mishears a word now
   // and then, and that is not the bug this guards against.
-  const heard = (r.transcript ?? '').toLowerCase().match(/[a-z]+/g) ?? [];
+  const heard = (r.transcript ?? '').toLowerCase().match(/[a-z0-9]+/g) ?? [];
   const missing = turn.spoken.filter((w) => !heard.includes(w));
   if (missing.length) console.log('  not heard verbatim:', missing.join(', '));
   // For a phrase spoken with a pause, require text beyond the first part: that

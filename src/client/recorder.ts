@@ -10,6 +10,46 @@ export type SttEvent = FinalTranscript | PartialTranscript;
 const TARGET_SAMPLE_RATE = 16000;
 
 /**
+ * Trailing silence sent to the provider when a turn ends.
+ *
+ * The provider drops the last word when the audio stops dead on it: a
+ * synthesized "what is two plus two" cut off on the final syllable comes back as
+ * "what is two plus" about a quarter of the time, while 400 ms of trailing
+ * silence closes the utterance and returns the whole phrase every time (0 ms:
+ * 6/8 runs whole, 400 ms: 8/8). Releasing the button the instant a word ends is
+ * exactly what people do, and a real microphone's room tone is only a frame or
+ * two, so the tail is padded here rather than left to chance.
+ */
+const TAIL_SILENCE_MS = 420;
+
+/** PCM16 silence, framed like the worklet's chunks. */
+function silenceFrames(ms: number): ArrayBuffer[] {
+  const total = Math.round((TARGET_SAMPLE_RATE * ms) / 1000);
+  const frames: ArrayBuffer[] = [];
+  for (let sent = 0; sent < total; sent += 1024) {
+    const count = Math.min(1024, total - sent);
+    frames.push(new Int16Array(count).buffer);
+  }
+  return frames;
+}
+
+/**
+ * Fetch and compile the capture worklet once per page. Compilation is the single
+ * slowest step of a cold first press, and it needs no user gesture, so it is
+ * started at load rather than on the press.
+ */
+let workletPromise: Promise<void> | null = null;
+const loadWorklet = (context: AudioContext): Promise<void> => {
+  if (!workletPromise) {
+    workletPromise = context.audioWorklet.addModule('/pcm-worklet.js').catch((err: unknown) => {
+      workletPromise = null; // allow a retry on the next press
+      throw err;
+    });
+  }
+  return workletPromise;
+};
+
+/**
  * Push-to-talk microphone capture.
  *
  * The transcription socket is opened once and kept for the life of the page:
@@ -30,6 +70,7 @@ export class Recorder {
   private ready: Promise<void> | null = null;
   private context: AudioContext | null = null;
   private stream: MediaStream | null = null;
+  private pendingStream: Promise<void> | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private node: AudioWorkletNode | null = null;
   private current: RecorderState = 'idle';
@@ -63,9 +104,23 @@ export class Recorder {
     return this.stopped;
   }
 
-  /** Grant a reusable mic stream. Call from a user gesture, before the first turn. */
+  /**
+   * Warm the parts of the first press that need no user gesture: the worklet
+   * fetch and compile. Called at page load.
+   */
+  preload(): void {
+    void loadWorklet(this.getContext()).catch(() => undefined);
+  }
+
+  /**
+   * Grant a reusable mic stream. Call from a user gesture, before the first turn.
+   *
+   * This runs on the same gesture that starts the first turn, so it shares the
+   * stream request with `start()` rather than issuing its own: two concurrent
+   * `getUserMedia` calls mean two prompts and two devices opened.
+   */
   async prime(): Promise<void> {
-    await this.ensureSocket().catch(() => undefined);
+    void this.ensureSocket().catch(() => undefined);
     try {
       await this.ensureStream();
       // Kick the AudioContext into `running` now; resuming later costs a frame.
@@ -94,7 +149,8 @@ export class Recorder {
       await this.ensureStream();
 
       const context = this.getContext();
-      await context.audioWorklet.addModule('/pcm-worklet.js');
+      // Started at load, so by the first press this is normally already resolved.
+      await loadWorklet(context);
 
       // The button may already have been released while the graph was being
       // built (a quick tap, or a slow permission prompt). Bail out rather than
@@ -142,16 +198,27 @@ export class Recorder {
   stop(): void {
     if (this.current === 'idle') return;
     this.turn++;
-    this.stopped = true;
-    this.setState('idle');
     if (!this.node) {
-      this.emitTurnEnd();
+      // The capture graph was never built, so this release cancelled the pending
+      // start (the bumped `turn` makes it bail out). There is no utterance to
+      // close, so settle the UI rather than wait for a transcript that will not
+      // arrive.
+      this.stopped = false;
+      this.setState('idle');
       return;
     }
+    this.stopped = true;
+    this.setState('idle');
     this.node.port.postMessage({ type: 'flush' });
     // Safety net in case the worklet never answers; finalize anyway.
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = setTimeout(() => this.finalize(), 120);
+  }
+
+  /** Send trailing silence so the provider can close the last segment. */
+  private padSilence(): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    for (const frame of silenceFrames(TAIL_SILENCE_MS)) this.socket.send(frame);
   }
 
   /** Tell the provider this utterance is over. */
@@ -159,6 +226,10 @@ export class Recorder {
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = null;
     void this.teardownGraph();
+    // The utterance's own audio is on the wire; give the provider the trailing
+    // silence it needs to close the last segment before asking it to flush, or
+    // the final word is dropped.
+    this.padSilence();
     // A non-empty partial means the provider is holding a segment it has not
     // finalized — normally the last word, since people release as they finish
     // speaking. `finalize` makes it flush that segment at once instead of waiting
@@ -203,30 +274,46 @@ export class Recorder {
     return this.context;
   }
 
-  private async ensureStream(): Promise<void> {
-    if (this.stream) return;
-    // Echo cancellation and noise suppression matter here: the assistant's own
-    // speech can otherwise loop back into the mic on open speakers and be
-    // transcribed as a user turn.
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    stream.getAudioTracks().forEach((track) => {
-      // A track that ends (device unplugged, permission revoked) invalidates the
-      // whole stream, so drop it and reacquire on the next turn.
-      track.addEventListener('ended', () => {
-        if (this.stream !== stream) return;
-        this.stream = null;
-        this.source?.disconnect();
-        this.source = null;
+  private ensureStream(): Promise<void> {
+    if (this.stream) return Promise.resolve();
+    // `prime()` and `start()` both run on the first press, so they must share one
+    // request: a second `getUserMedia` would prompt again and open a second device.
+    if (this.pendingStream) return this.pendingStream;
+    const request = (async () => {
+      // Echo cancellation and noise suppression matter here: the assistant's own
+      // speech can otherwise loop back into the mic on open speakers and be
+      // transcribed as a user turn.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
-    });
-    this.stream = stream;
+      stream.getAudioTracks().forEach((track) => {
+        // A track that ends (device unplugged, permission revoked) invalidates the
+        // whole stream, so drop it and reacquire on the next turn.
+        track.addEventListener('ended', () => {
+          if (this.stream !== stream) return;
+          this.stream = null;
+          this.source?.disconnect();
+          this.source = null;
+        });
+      });
+      this.stream = stream;
+    })();
+    this.pendingStream = request;
+    // Clear on both outcomes so a denied prompt can be retried next press.
+    request.then(
+      () => {
+        if (this.pendingStream === request) this.pendingStream = null;
+      },
+      () => {
+        if (this.pendingStream === request) this.pendingStream = null;
+      },
+    );
+    return request;
   }
 
   private ensureSocket(): Promise<void> {
