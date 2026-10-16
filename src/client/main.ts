@@ -1,4 +1,5 @@
 import { Recorder, type RecorderState } from './recorder.js';
+import { SpeechPlayer } from './speech.js';
 import { Assistant } from './assistant.js';
 
 const el = <T extends HTMLElement>(selector: string): T => {
@@ -14,7 +15,8 @@ const answer = el<HTMLParagraphElement>('#answer');
 const meter = el<HTMLDivElement>('#meter');
 
 const recorder = new Recorder();
-const assistant = new Assistant(recorder);
+const speech = new SpeechPlayer();
+const assistant = new Assistant(speech);
 
 let phase: RecorderState = 'idle';
 
@@ -37,6 +39,7 @@ const idleStatus = (): void => {
  * ---------------------------------------------------------------- */
 const startListening = (): void => {
   if (phase !== 'idle') return;
+  // Speaking over the assistant: drop its audio and take the turn.
   if (assistant.isBusy) assistant.cancel();
   transcript.textContent = '';
   answer.textContent = '';
@@ -95,7 +98,10 @@ recorder.state.on((next) => {
 
 recorder.transcripts.on((event) => {
   transcript.textContent = event.text;
-  if (event.type === 'final') setStatus('Thinking…', 'think');
+  if (event.type === 'final') {
+    setStatus('Thinking…', 'think');
+    void assistant.ask(event.text);
+  }
 });
 
 recorder.level.on((value) => {
@@ -116,6 +122,22 @@ assistant.speaking.on((speaking) => {
 
 assistant.errors.on(showError);
 
-setInterval(() => assistant.tick(), 200);
+/* ------------------------------------------------ *
+ * Warm start
+ * ------------------------------------------------ */
+// The first gesture is the only chance to unlock audio and grant the mic, so
+// use it to open every connection the assistant will need. After this, a turn
+// costs no setup at all.
+let primed = false;
+const prime = (): void => {
+  if (primed) return;
+  primed = true;
+  void speech.resume();
+  void recorder.prime();
+  document.removeEventListener('pointerdown', prime);
+  document.removeEventListener('keydown', prime);
+};
+document.addEventListener('pointerdown', prime);
+document.addEventListener('keydown', prime);
 
 idleStatus();

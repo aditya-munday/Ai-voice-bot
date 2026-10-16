@@ -1,4 +1,5 @@
 import { Emitter } from './events.js';
+import type { SttServerMessage } from '../protocol.js';
 
 export type RecorderState = 'idle' | 'starting' | 'recording';
 
@@ -9,9 +10,15 @@ export type SttEvent = FinalTranscript | PartialTranscript;
 const TARGET_SAMPLE_RATE = 16000;
 
 /**
- * Push-to-talk microphone capture. Streams 16 kHz linear16 PCM to the server's
- * STT relay and surfaces transcript events. The AudioWorklet keeps resampling
- * off the main thread so the UI stays responsive while recording.
+ * Push-to-talk microphone capture.
+ *
+ * The transcription socket is opened once and kept for the life of the page:
+ * reconnecting per turn would add a handshake to the front of every utterance,
+ * which is exactly the latency this project exists to avoid. Audio only flows
+ * while the button is held; between turns the socket simply sits ready.
+ *
+ * Capture itself lives in an AudioWorklet, so resampling and framing never touch
+ * the main thread.
  */
 export class Recorder {
   readonly transcripts = new Emitter<SttEvent>();
@@ -20,11 +27,15 @@ export class Recorder {
   readonly state = new Emitter<RecorderState>();
 
   private socket: WebSocket | null = null;
+  private ready: Promise<void> | null = null;
   private context: AudioContext | null = null;
   private stream: MediaStream | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private node: AudioWorkletNode | null = null;
   private current: RecorderState = 'idle';
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped on every start/stop so a slow start can detect it was cancelled. */
+  private turn = 0;
 
   private setState(next: RecorderState): void {
     this.current = next;
@@ -35,25 +46,37 @@ export class Recorder {
     return this.current === 'recording';
   }
 
+  /** Grant a reusable mic stream. Call from a user gesture, before the first turn. */
+  async prime(): Promise<void> {
+    await this.ensureSocket().catch(() => undefined);
+    try {
+      await this.ensureStream();
+      // Kick the AudioContext into `running` now; resuming later costs a frame.
+      const context = this.getContext();
+      if (context.state === 'suspended') await context.resume().catch(() => undefined);
+    } catch (err) {
+      this.errors.emit(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async start(): Promise<void> {
     if (this.current !== 'idle') return;
+    const turn = ++this.turn;
     this.setState('starting');
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      await this.ensureSocket();
+      await this.ensureStream();
 
-      this.context = new AudioContext({ latencyHint: 'interactive' });
-      await this.context.audioWorklet.addModule('/pcm-worklet.js');
-      await this.openSocket();
+      const context = this.getContext();
+      await context.audioWorklet.addModule('/pcm-worklet.js');
 
-      this.source = this.context.createMediaStreamSource(this.stream);
-      this.node = new AudioWorkletNode(this.context, 'pcm16-capture', {
+      // The button may already have been released while the graph was being
+      // built (a quick tap, or a slow permission prompt). Bail out rather than
+      // leaving a live capture graph streaming with nothing to stop it.
+      if (turn !== this.turn) return;
+
+      this.source = context.createMediaStreamSource(this.stream!);
+      this.node = new AudioWorkletNode(context, 'pcm16-capture', {
         numberOfInputs: 1,
         numberOfOutputs: 0,
         channelCount: 1,
@@ -63,91 +86,135 @@ export class Recorder {
       });
 
       this.node.port.onmessage = (event: MessageEvent) => {
-        const data = event.data as { type: string; pcm?: Int16Array; rms?: number };
-        if (data.type === 'audio' && data.pcm) this.send(data.pcm);
-        else if (data.type === 'level' && typeof data.rms === 'number') this.level.emit(Math.min(1, data.rms * 4.5));
+        const data = event.data as { type: string; pcm?: Int16Array; rms?: number; last?: boolean };
+        if (data.type === 'audio' && data.pcm) {
+          this.send(data.pcm);
+          if (data.last) this.finalizeTurn();
+        } else if (data.type === 'flushed') {
+          this.finalizeTurn();
+        } else if (data.type === 'level' && typeof data.rms === 'number') {
+          this.level.emit(Math.min(1, data.rms * 4.5));
+        }
       };
 
       this.source.connect(this.node);
-      await this.context.resume();
+      await context.resume();
       this.setState('recording');
     } catch (err) {
       this.errors.emit(err instanceof Error ? err.message : String(err));
-      await this.teardown();
+      await this.teardownGraph();
       this.setState('idle');
     }
   }
 
-  /** Ends the utterance: flushes the STT buffer, keeps the socket for the final event. */
+  /**
+   * Ends the utterance. The worklet still holds up to one chunk of audio, so ask
+   * it to flush first and only send `finalize` once that tail is on the wire —
+   * otherwise releasing the button can clip the last word. The socket stays open.
+   */
   stop(): void {
     if (this.current === 'idle') return;
+    this.turn++;
+    this.setState('idle');
+    if (!this.node) return;
+    this.node.port.postMessage({ type: 'flush' });
+    // Safety net in case the worklet never answers; finalize anyway.
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = setTimeout(() => this.finalizeTurn(), 120);
+  }
+
+  private finalizeTurn(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ type: 'finalize' }));
     }
-    void this.teardown();
-    this.setState('idle');
+    void this.teardownGraph();
   }
 
-  private openSocket(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const socket = new WebSocket(`${proto}://${location.host}/api/stt`);
-      this.socket = socket;
-      socket.binaryType = 'arraybuffer';
+  private getContext(): AudioContext {
+    if (!this.context) this.context = new AudioContext({ latencyHint: 'interactive' });
+    return this.context;
+  }
 
+  private async ensureStream(): Promise<void> {
+    if (this.stream) return;
+    // Echo cancellation and noise suppression matter here: the assistant's own
+    // speech can otherwise loop back into the mic on open speakers and be
+    // transcribed as a user turn.
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    stream.getAudioTracks().forEach((track) => {
+      // A track that ends (device unplugged, permission revoked) invalidates the
+      // whole stream, so drop it and reacquire on the next turn.
+      track.addEventListener('ended', () => {
+        if (this.stream !== stream) return;
+        this.stream = null;
+        this.source?.disconnect();
+        this.source = null;
+      });
+    });
+    this.stream = stream;
+  }
+
+  private ensureSocket(): Promise<void> {
+    if (this.ready) return this.ready;
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${proto}://${location.host}/api/stt`);
+    socket.binaryType = 'arraybuffer';
+    this.socket = socket;
+
+    this.ready = new Promise<void>((resolve, reject) => {
       const failEarly = (): void => reject(new Error('could not reach the speech service'));
       socket.onopen = () => resolve();
       socket.onerror = failEarly;
-
-      socket.onmessage = (event: MessageEvent) => {
-        let data: { transcript?: string; is_final?: boolean; type?: string; message?: string };
-        try {
-          data = JSON.parse(typeof event.data === 'string' ? event.data : '');
-        } catch {
-          return;
-        }
-        if (data.type === 'error') {
-          if (this.current === 'starting') reject(new Error(data.message ?? 'speech service error'));
-          this.errors.emit(data.message ?? 'speech service error');
-          return;
-        }
-        const text = (data.transcript ?? '').trim();
-        if (!text) return;
-        this.transcripts.emit(data.is_final ? { type: 'final', text } : { type: 'partial', text });
+      socket.onclose = () => {
+        this.ready = null;
+        this.socket = null;
       };
+      socket.onmessage = (event: MessageEvent) => this.onMessage(event);
     });
+    return this.ready;
+  }
+
+  private onMessage(event: MessageEvent): void {
+    let data: SttServerMessage;
+    try {
+      data = JSON.parse(typeof event.data === 'string' ? event.data : '') as SttServerMessage;
+    } catch {
+      return;
+    }
+    if (data.type === 'error') {
+      this.errors.emit(data.message);
+      return;
+    }
+    if (data.type === 'transcript') {
+      const text = data.text.trim();
+      if (!text) return;
+      this.transcripts.emit(data.final ? { type: 'final', text } : { type: 'partial', text });
+    }
   }
 
   private send(pcm: Int16Array): void {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
-    const view = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-    const copy = new Uint8Array(view.length);
-    copy.set(view);
-    this.socket.send(copy.buffer);
+    // The worklet transfers ownership of each chunk's buffer to this thread, so
+    // it is already private and can go straight out.
+    this.socket.send(pcm.buffer as ArrayBuffer);
   }
 
-  private async teardown(): Promise<void> {
+  /** Tear down only the capture graph; the socket and stream are reused. */
+  private async teardownGraph(): Promise<void> {
     this.node?.port.close();
     this.node?.disconnect();
     this.node = null;
 
     this.source?.disconnect();
     this.source = null;
-
-    this.stream?.getTracks().forEach((track) => track.stop());
-    this.stream = null;
-
-    if (this.context) {
-      await this.context.close().catch(() => undefined);
-      this.context = null;
-    }
-
-    const socket = this.socket;
-    this.socket = null;
-    if (socket) {
-      // Give smallest.ai a moment to deliver the terminal transcript before closing.
-      setTimeout(() => socket.close(), 1200);
-    }
 
     this.level.emit(0);
   }

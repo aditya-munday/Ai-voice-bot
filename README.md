@@ -40,16 +40,23 @@ src/
   server.ts          HTTP + WebSocket server, provider proxies, static files
   config.ts          env-driven configuration
   env.ts             tiny .env loader
+  protocol.ts        shared client/server message types
+  segment.ts         sentence segmenter shared by the client and latency harness
+  sanitize.ts        strips symbols the speech engine would read badly
   client/
     main.ts          DOM wiring and push-to-talk gestures
     recorder.ts      mic capture -> STT WebSocket, transcript events
     assistant.ts     Groq streaming -> sentence chunking -> TTS -> playback
+    speech.ts        TTS WebSocket -> PCM playback timeline
     worklet.ts       AudioWorklet: mono mixdown, resample, PCM16 framing
     events.ts        typed pub/sub
 public/
   index.html         the entire UI
   styles.css
-scripts/build.mjs    esbuild bundles (server, client, worklet)
+scripts/build.mjs       esbuild bundles (server, client, worklet)
+scripts/smoke.mjs       provider round-trip checks (TTS, chat, STT)
+scripts/e2e-browser.mjs headless browser test of the whole turn
+scripts/latency.mts     release-to-first-audio measurement
 ```
 
 `public/main.js` and `public/pcm-worklet.js` are build output, not source.
@@ -85,9 +92,41 @@ values here. `lightning_v3.1` voices use a separate catalog from
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/api/chat` | Groq chat completion, streamed back as SSE |
-| `POST` | `/api/tts` | smallest.ai synthesis, returns `audio/wav` |
+| `WS` | `/api/tts` | smallest.ai synthesis: send text, receive raw PCM frames |
 | `WS` | `/api/stt` | relays PCM to smallest.ai, returns transcript events |
 | `GET` | `/api/health` | active models and whether keys are present |
+
+Both WebSocket relays stay open across turns, so a turn pays no handshake.
+
+## Measured latency
+
+From `scripts/latency.mts` against the live providers, warm (a turn after the
+first), measured on this machine:
+
+| Stage | Typical |
+| --- | --- |
+| Release -> first Groq token | 90-150 ms |
+| Release -> first audio out of the speaker | 420-500 ms |
+
+The first turn is slower while the mic, audio graph, and provider sockets are
+opened; the page primes all of them on your first gesture so this is paid before
+you speak, not after you release.
+
+## Tests
+
+```bash
+npm run build && npm start   # in one shell, leave it running
+npm test                     # provider round-trips (TTS, chat, STT)
+npm run test:e2e             # whole turn through the real page in headless Chromium
+npm run latency              # release-to-first-audio, printed per turn
+```
+
+`npm test` synthesizes speech, feeds it through the STT relay, and asserts the
+transcript comes back, so it exercises every leg against the live providers.
+`npm run test:e2e` goes further: it launches headless Chromium, swaps the
+microphone for a WAV it synthesizes itself, drives the push-to-talk button over
+the DevTools protocol, and asserts the transcript, the streamed reply, and the
+UI returning to Ready. It needs `chromium` on `PATH`.
 
 ## Keyboard and touch
 

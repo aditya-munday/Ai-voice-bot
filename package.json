@@ -8,7 +8,10 @@
     "build": "node scripts/build.mjs",
     "start": "node dist/server.js",
     "dev": "node scripts/build.mjs --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/smoke.mjs && node scripts/test-sanitize.mts",
+    "test:e2e": "node scripts/e2e-browser.mjs",
+    "latency": "node scripts/latency.mts"
   },
   "dependencies": {
     "ws": "^8.18.0"
