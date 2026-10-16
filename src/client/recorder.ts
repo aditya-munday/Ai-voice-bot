@@ -48,8 +48,6 @@ export class Recorder {
   private partial = '';
   private stopped = false;
   private finalTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Samples sent since the provider last finalized, i.e. its unconfirmed tail. */
-  private audioSinceFinal = 0;
 
   private setState(next: RecorderState): void {
     this.current = next;
@@ -91,7 +89,6 @@ export class Recorder {
     this.segments = [];
     this.partial = '';
     this.stopped = false;
-    this.audioSinceFinal = 0;
     try {
       await this.ensureSocket();
       await this.ensureStream();
@@ -162,17 +159,25 @@ export class Recorder {
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = null;
     void this.teardownGraph();
+    // A non-empty partial means the provider is holding a segment it has not
+    // finalized — normally the last word, since people release as they finish
+    // speaking. `finalize` makes it flush that segment at once instead of waiting
+    // out its own end-of-utterance timeout: measured ~140 ms against ~550 ms, and
+    // the flushed final carries the whole word where the running partial can be a
+    // few characters short ("Polymor" for "Polymorphism"). So commit the turn on
+    // that final, not on a timer that would race it.
+    const pending = this.partial.trim();
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ type: 'finalize' }));
     }
-    // Everything heard so far is already in `partial`, so answering can start now.
-    // If the provider has not confirmed the tail we flushed, give it a brief
-    // window to correct our text before the caller commits to it.
-    if (this.audioSinceFinal > 0) {
+    if (pending) {
+      // The final normally lands in well under 200 ms; this only bounds a
+      // provider that never answers.
       if (this.finalTimer) clearTimeout(this.finalTimer);
-      this.finalTimer = setTimeout(() => this.emitTurnEnd(), 150);
+      this.finalTimer = setTimeout(() => this.emitTurnEnd(), 500);
       return;
     }
+    // Everything heard is already final, so there is nothing to wait for.
     this.emitTurnEnd();
   }
 
@@ -263,7 +268,6 @@ export class Recorder {
       // segment; ignore it so it does not add a stray space.
       if (text) this.segments.push(text);
       this.partial = '';
-      this.audioSinceFinal = 0;
       // The release has already happened and this is the segment it was waiting
       // for, so end the turn now rather than sitting on the timeout.
       if (this.stopped) {
@@ -282,7 +286,6 @@ export class Recorder {
 
   private send(pcm: Int16Array): void {
     if (this.socket?.readyState !== WebSocket.OPEN) return;
-    this.audioSinceFinal += pcm.length;
     // The worklet transfers ownership of each chunk's buffer to this thread, so
     // it is already private and can go straight out.
     this.socket.send(pcm.buffer as ArrayBuffer);

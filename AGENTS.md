@@ -55,6 +55,16 @@ All source is TypeScript.
     end of the user's turn answers people while they are still speaking and
     starts a second turn on release. `recorder.ts` accumulates those finals;
     only the button release commits the turn.
+  - That same pause-splitting is why the release must wait for `finalize` to
+    answer. The provider punctuates each fragment as a sentence ("What is?
+    Polymorphism.") and, worse, its running partial can be a few characters short
+    of the word it is still holding ("Polymor" for "Polymorphism"). `finalize`
+    forces an immediate flush — measured ~140 ms, against ~550 ms for the
+    provider's own end-of-utterance final — and the flushed final carries the
+    whole word. Committing on a short fixed timer instead races that flush and
+    non-deterministically drops the segment after the pause, so the model answers
+    only the first half of the question. See `finalize()` in `recorder.ts`.
+  - Not every pause splits a segment, so a dropped tail looks intermittent.
 - Groq model availability is account-specific. `openai/gpt-oss-20b` is the fast
   default here; `llama-3.1-8b-instant` is not enabled on every account.
 
@@ -63,7 +73,12 @@ All source is TypeScript.
 `scripts/smoke.mjs` (`npm test`) checks all three legs against the live providers:
 it synthesizes speech, feeds it through the STT relay, and asserts a transcript
 comes back. `scripts/e2e-browser.mjs` (`npm run test:e2e`) drives the real page in
-headless Chromium with a synthesized microphone and asserts the whole turn.
+headless Chromium with a synthesized microphone and asserts the whole turn. Pass
+a phrase containing `|` to speak it with a pause between the parts, e.g.
+`PHRASE="what is|polymorphism" npm run test:e2e`, which exercises the
+pause-split path above; the harness then asserts text arrived beyond the first
+part. It does not assert exact spelling, since the recognizer legitimately
+mishears a word now and then.
 `scripts/latency.mts` (`npm run latency`) measures release-to-first-audio and is
 the tool to use when judging a latency change. `scripts/latency-e2e.mjs` does the
 same inside the real page and prints a per-stage breakdown (transcript commit,

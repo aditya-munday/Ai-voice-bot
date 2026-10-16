@@ -10,7 +10,10 @@ import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import WebSocket from 'ws';
 
-const PHRASE = process.env.PHRASE ?? process.argv[2] ?? 'what is two plus two';
+/** A phrase split on `|` is spoken with a pause between the parts, which forces
+ *  the provider to close a segment mid-utterance. */
+const parsePhrase = (raw) => (raw.includes('|') ? raw.split('|') : raw);
+const PHRASE = parsePhrase(process.env.PHRASE ?? process.argv[2] ?? 'what is two plus two');
 const WAV = process.env.WAV ?? `/tmp/e2e-speech-${process.pid}.wav`;
 const PAGE = process.env.PAGE ?? 'http://localhost:12000/';
 const PORT = Number(process.env.CDP_PORT ?? 9333);
@@ -22,8 +25,7 @@ const HOST = process.env.HOST ?? 'localhost:12000';
  *  The relay's `tts_end` means "the context is closed", not "all audio has been
  *  delivered" — the provider offers no frame for the latter. So the fixture
  *  collects frames until they stop arriving, rather than trusting that signal. */
-async function makeWav(text, out = WAV) {
-  if (existsSync(out) && process.env.WAV) return; // caller supplied one
+async function synthPcm(text) {
   const ws = new WebSocket(`ws://${HOST}/api/tts`);
   const parts = [];
   await new Promise((resolve, reject) => {
@@ -60,8 +62,12 @@ async function makeWav(text, out = WAV) {
     ws.on('error', reject);
   });
   ws.close();
+  return Buffer.concat(parts);
+}
 
-  const pcm = Buffer.concat(parts);
+/** Wrap PCM in a 16 kHz mono WAV, appending a second of silence so a restart is
+ *  detectable. */
+function writePcmWav(pcm, out) {
   const data = Buffer.concat([pcm, Buffer.alloc(16000 * 2)]);
   const h = Buffer.alloc(44);
   h.write('RIFF', 0);
@@ -81,7 +87,21 @@ async function makeWav(text, out = WAV) {
   return (pcm.length / 2 / 16000).toFixed(2);
 }
 
-const TURN_2 = process.env.PHRASE2;
+/** Build the fixture WAV. A phrase given as an array is spoken with a pause
+ *  between the parts, which is what makes the provider's VAD close a segment
+ *  mid-utterance — the case that used to lose the last word. */
+async function makeWav(phrase, out = WAV) {
+  if (existsSync(out) && process.env.WAV) return; // caller supplied one
+  const parts = Array.isArray(phrase) ? phrase : [phrase];
+  const pcm = [];
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) pcm.push(Buffer.alloc(16000 * 2 * 0.7)); // 700 ms pause
+    pcm.push(await synthPcm(parts[i]));
+  }
+  return writePcmWav(Buffer.concat(pcm), out);
+}
+
+const TURN_2 = process.env.PHRASE2 ? parsePhrase(process.env.PHRASE2) : null;
 await makeWav(PHRASE, WAV);
 const wavB64 = readFileSync(WAV).toString('base64');
 let wav2B64 = '';
@@ -340,8 +360,9 @@ await evaluate(`(() => {
   };
 })()`);
 
-const turns = [{ label: 'turn 1', b64: wavB64, hold: 3800 }];
-if (TURN_2) turns.push({ label: 'turn 2', b64: wav2B64, hold: 3800 });
+const wordsOf = (p) => (Array.isArray(p) ? p.join(' ') : p).toLowerCase().match(/[a-z]+/g) ?? [];
+const turns = [{ label: 'turn 1', b64: wavB64, hold: 3800, spoken: wordsOf(PHRASE), phrase: PHRASE }];
+if (TURN_2) turns.push({ label: 'turn 2', b64: wav2B64, hold: 3800, spoken: wordsOf(TURN_2), phrase: TURN_2 });
 
 let ok = true;
 const results = [];
@@ -351,6 +372,7 @@ for (const turn of turns) {
   results.push(r);
   console.log(`\n${turn.label}`);
   console.log('  transcript:', JSON.stringify(r.transcript));
+  console.log('  answer:    ', JSON.stringify(r.answer));
   console.log('  status:    ', JSON.stringify(r.status));
   console.log('  mic peak:  ', r.peak, '| audio sent:', r.sent.audioBytes, 'bytes');
   console.log('  audio peak:', r.audioPeak, '| active samples:', r.audioActiveSamples);
@@ -365,6 +387,21 @@ for (const turn of turns) {
   // The turn must not end before the button is released: every stage timestamp
   // is relative to release, so a negative value means it started too early.
   ok &&= r.timing.speaking === null || r.timing.speaking >= 0;
+  // Every word spoken must appear in the transcript. This is the check that
+  // catches a dropped tail: the provider can close a segment on a mid-sentence
+  // pause, and committing before it flushes loses the word after the pause.
+  // Spelling is not asserted — the recognizer legitimately mishears a word now
+  // and then, and that is not the bug this guards against.
+  const heard = (r.transcript ?? '').toLowerCase().match(/[a-z]+/g) ?? [];
+  const missing = turn.spoken.filter((w) => !heard.includes(w));
+  if (missing.length) console.log('  not heard verbatim:', missing.join(', '));
+  // For a phrase spoken with a pause, require text beyond the first part: that
+  // is the segment the old fixed timer used to race and drop.
+  const firstPart = wordsOf(Array.isArray(turn.phrase) ? turn.phrase[0] : turn.phrase);
+  if (Array.isArray(turn.phrase) && turn.phrase.length > 1) {
+    ok &&= heard.length > firstPart.length;
+  }
+  ok &&= heard.length >= Math.ceil(turn.spoken.length * 0.6);
 }
 
 console.log(ok ? '\nE2E PASS' : '\nE2E FAIL');
