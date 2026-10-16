@@ -45,8 +45,16 @@ All source is TypeScript.
     `sample_rate`. Omit one and the service validates that message as a fresh
     request and fails with a misleading "language not enabled" error, killing
     the context before any audio is produced. See `base()` in `src/server.ts`.
-  - The terminal `complete` frame can lag the last audio frame by seconds. Do not
-    gate UI state on it; `SpeechPlayer` ends the turn from the audio clock.
+  - TTS has no frame that means "this context is fully done". It emits `complete`
+    after *every* fragment it releases, not once per context, so forwarding it as
+    the end of the turn stops playback mid-reply. The relay therefore sends
+    `tts_end` only when the client itself closes the context
+    (`context_close`), and the player then ends the turn from real state: text
+    complete, all scheduled buffers ended, and a short quiet window elapsed.
+  - STT emits its own `is_final` after any pause, mid-hold. Treating that as the
+    end of the user's turn answers people while they are still speaking and
+    starts a second turn on release. `recorder.ts` accumulates those finals;
+    only the button release commits the turn.
 - Groq model availability is account-specific. `openai/gpt-oss-20b` is the fast
   default here; `llama-3.1-8b-instant` is not enabled on every account.
 
@@ -57,7 +65,11 @@ it synthesizes speech, feeds it through the STT relay, and asserts a transcript
 comes back. `scripts/e2e-browser.mjs` (`npm run test:e2e`) drives the real page in
 headless Chromium with a synthesized microphone and asserts the whole turn.
 `scripts/latency.mts` (`npm run latency`) measures release-to-first-audio and is
-the tool to use when judging a latency change. All need the server running.
+the tool to use when judging a latency change. `scripts/latency-e2e.mjs` does the
+same inside the real page and prints a per-stage breakdown (transcript commit,
+first token, first audio); `scripts/probe-contracts.mjs` records the raw provider
+frames so the assumptions above can be re-checked rather than trusted. All need
+the server running.
 
 For a manual check:
 
@@ -78,8 +90,9 @@ Two things to know when working on the browser test or the player:
 - Headless Chromium has no audio sink, so `AudioContext.currentTime` never
   advances. Anything that decides "playback finished" by polling that clock will
   hang forever there (and on a real machine it is still a fine way to get stuck
-  if the device stalls). Measure the queued duration once and drive the timer off
-  the wall clock, with `BufferSource.onended` as the backstop.
+  if the device stalls). `SpeechPlayer` therefore ends a turn from
+  `BufferSource.onended` plus a quiet window since the last incoming frame — both
+  of which fire without a sink — rather than from the audio clock.
 - Chromium's `--use-file-for-fake-audio-capture` device frequently delivers
   silence in headless. `scripts/e2e-browser.mjs` instead overrides
   `navigator.mediaDevices.getUserMedia` to return a `MediaStreamAudioDestinationNode`
