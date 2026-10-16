@@ -245,6 +245,10 @@ const attachTtsRelay = (server: http.Server): void => {
           if (!contextId) break;
           upstream.send(JSON.stringify({ ...base(), context_id: contextId, context_close: true }));
           contextId = null;
+          // The provider never marks a context as fully done, so this is the only
+          // reliable end-of-turn signal. Emit it after the close, when no further
+          // audio can be produced for this context.
+          sendControl(client, { type: 'tts_end' } satisfies TtsServerMessage);
           break;
         }
         case 'tts_cancel': {
@@ -281,7 +285,10 @@ const attachTtsRelay = (server: http.Server): void => {
         return;
       }
       if (parsed.status === 'complete') {
-        sendControl(client, { type: 'tts_end' } satisfies TtsServerMessage);
+        // The provider emits `complete` after every fragment it releases, not
+        // once per context, so this cannot be forwarded as-is: the page would
+        // treat a mid-reply release as the end of the turn and stop speaking.
+        // `tts_end` is sent only when the client itself closes the context.
         return;
       }
       if (parsed.status === 'error') {

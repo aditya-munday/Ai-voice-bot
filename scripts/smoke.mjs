@@ -57,6 +57,7 @@ async function testTts() {
   let ready = false;
   let ended = false;
   let error = null;
+  let lastFrames = 0;
   ws.on('message', (raw, isBinary) => {
     if (isBinary) {
       frames++;
@@ -72,7 +73,16 @@ async function testTts() {
   ws.send(JSON.stringify({ type: 'tts_start', sampleRate: 0 }));
   ws.send(JSON.stringify({ type: 'tts_text', text: 'The quick brown fox jumps over the lazy dog.' }));
   ws.send(JSON.stringify({ type: 'tts_finish' }));
-  for (let i = 0; i < 100 && !ended; i++) await sleep(100);
+  // `tts_end` only means the context was closed; audio frames can still be in
+  // flight, so wait for the frames themselves to stop arriving.
+  for (let i = 0; i < 100; i++) {
+    if (ended && frames > 0) {
+      await sleep(400);
+      if (frames === lastFrames) break;
+      lastFrames = frames;
+    }
+    await sleep(100);
+  }
   ws.close();
   check('tts: ready handshake', ready);
   check('tts: audio frames', frames > 0 && bytes > 1000, `${frames} frames, ${bytes} bytes`);

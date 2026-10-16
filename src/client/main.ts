@@ -93,7 +93,10 @@ recorder.state.on((next) => {
   talk.dataset.state = next;
   if (next === 'starting') setStatus('Opening microphone…', 'live');
   if (next === 'recording') setStatus('Listening… release to send', 'live');
-  if (next === 'idle') idleStatus();
+  // Back to idle while the turn is still being finalized (waiting for the
+  // provider's last words) — keep the live indicator up rather than flashing
+  // "Ready" and then "Thinking".
+  if (next === 'idle' && !recorder.isFinalizing) idleStatus();
 });
 
 recorder.transcripts.on((event) => {

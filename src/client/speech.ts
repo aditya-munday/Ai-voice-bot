@@ -1,27 +1,31 @@
 import { Emitter } from './events.js';
 import type { TtsServerMessage } from '../protocol.js';
 
+/** Audio clock lead before the first frame. Absorbs jitter without an audible delay. */
+const LEAD_SECONDS = 0.06;
+
+/** How long the audio stream must be silent before the turn is considered over. */
+const QUIET_MS = 350;
+
 /**
  * Streaming speech player.
  *
  * Owns one persistent WebSocket to the server's TTS relay and a Web Audio
- * timeline. PCM frames are pushed into a scheduling queue and played through
- * `AudioBufferSourceNode`s placed at exact times, which is what keeps the speech
- * gapless: unlike chaining `<audio>` elements, one node can be scheduled while
- * the previous is still sounding, so there is no per-clip start latency.
+ * timeline. Each PCM frame that arrives is placed on the timeline at an exact
+ * time, so consecutive frames abut: unlike chaining `<audio>` elements, the next
+ * buffer is scheduled while the previous one is still sounding, which removes the
+ * per-clip start latency and the gap between clips.
  *
- * A small lead (LEAD_SECONDS) is kept ahead of the clock. If the producer ever
- * falls behind — a slow segment, a GC pause — the timeline is re-anchored
- * instead of glitching.
+ * A small lead (LEAD_SECONDS) is kept ahead of the clock. If the producer falls
+ * behind — a slow segment, a GC pause — the timeline is re-anchored rather than
+ * glitching.
+ *
+ * Frames are scheduled one buffer per network frame, at whatever size it arrives.
+ * An earlier version re-blocked them into fixed 1024-sample buffers; that left a
+ * sub-frame remainder stranded in a queue, which then needed a "flush" step and a
+ * guess at when the producer had really stopped. Scheduling each frame as it comes
+ * removes the remainder, and with it the guess.
  */
-
-/** Fixed scheduling block. ~43 ms at 24 kHz: short enough to be responsive,
- *  long enough that we are not creating a node per network frame. */
-const FRAME_SAMPLES = 1024;
-
-/** Audio clock lead before the first block. Absorbs jitter without an audible delay. */
-const LEAD_SECONDS = 0.06;
-
 export class SpeechPlayer {
   readonly speaking = new Emitter<boolean>();
   readonly errors = new Emitter<string>();
@@ -32,13 +36,22 @@ export class SpeechPlayer {
   private context: AudioContext | null = null;
   private sampleRate = 24000;
 
-  private chunks: Float32Array[] = [];
-  private available = 0;
   private scheduledUntil = 0;
   private live = 0;
   private active = false;
   private generation = 0;
-  private finishTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * End-of-turn tracking. `tts_end` means "the context is closed", which is *not*
+   * the same as "all audio has arrived": the provider emits no frame for that, and
+   * the close can even reach us before the last frames do. So the turn ends when
+   * the text is complete, every scheduled buffer has finished, and no new audio
+   * has arrived for a short quiet period.
+   */
+  private textDone = false;
+  private lastAudioAt = 0;
+  private finishTimer: ReturnType<typeof setInterval> | null = null;
+  private finishDeadline = 0;
 
   /** Open a synthesis context and begin a fresh playback timeline. */
   async begin(): Promise<void> {
@@ -67,45 +80,16 @@ export class SpeechPlayer {
   /** No more text for this utterance. */
   finish(): void {
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ type: 'tts_finish' }));
-    // The service's terminal frame can lag the last audio frame by seconds, so
-    // do not depend on it to leave the speaking state. Arm a watchdog that ends
-    // the turn once the audio clock has passed the end of scheduled playback;
-    // any later frame that arrives just cancels it.
-    this.armFinishWatchdog();
+    this.beginFinish();
   }
 
   /** Stop everything: drop queued audio, silence the timeline, abandon synthesis. */
   cancel(): void {
     this.generation++;
-    this.clearFinishWatchdog();
+    this.stopFinishWatchdog();
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ type: 'tts_cancel' }));
     this.resetTimeline();
     this.setActive(false);
-  }
-
-  private clearFinishWatchdog(): void {
-    if (this.finishTimer) clearTimeout(this.finishTimer);
-    this.finishTimer = null;
-  }
-
-  private armFinishWatchdog(): void {
-    this.clearFinishWatchdog();
-    const generation = this.generation;
-    const context = this.context;
-    // How much audio is still queued ahead of the playhead. Measured once, then
-    // driven by the wall clock: re-reading the audio clock each tick would hang
-    // forever if it never advances (an environment with no audio sink).
-    const remaining = context ? Math.max(0, this.scheduledUntil - context.currentTime) : 0;
-    this.finishTimer = setTimeout(
-      () => {
-        if (generation !== this.generation) return;
-        this.finishTimeline();
-        // Buffers can still be mid-playback if the clock ran slower than the
-        // timer; `onended` is the backstop for that case.
-        if (this.live === 0) this.setActive(false);
-      },
-      remaining * 1000 + 150,
-    );
   }
 
   get isSpeaking(): boolean {
@@ -119,11 +103,44 @@ export class SpeechPlayer {
   }
 
   private resetTimeline(): void {
-    this.chunks.length = 0;
-    this.available = 0;
     this.scheduledUntil = 0;
     this.live = 0;
+    this.textDone = false;
+    this.lastAudioAt = Date.now();
   }
+
+  /* ---------------------------------------------------------------- *
+   * End of turn
+   * ---------------------------------------------------------------- */
+
+  private beginFinish(): void {
+    this.textDone = true;
+    this.lastAudioAt = Date.now();
+    this.finishDeadline = Date.now() + 6000;
+    this.stopFinishWatchdog();
+    this.finishTimer = setInterval(() => this.maybeEnd(), 100);
+    this.maybeEnd();
+  }
+
+  private maybeEnd(): void {
+    if (!this.textDone) return;
+    const quiet = Date.now() - this.lastAudioAt;
+    const drained = this.live === 0 && quiet >= QUIET_MS;
+    const past = Date.now() > this.finishDeadline;
+    if (!drained && !past) return;
+    this.textDone = false;
+    this.stopFinishWatchdog();
+    this.setActive(false);
+  }
+
+  private stopFinishWatchdog(): void {
+    if (this.finishTimer) clearInterval(this.finishTimer);
+    this.finishTimer = null;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Socket
+   * ---------------------------------------------------------------- */
 
   /** Resolve once the relay socket is connected and usable. */
   private ensureSocket(): Promise<void> {
@@ -161,8 +178,9 @@ export class SpeechPlayer {
         this.sampleRate = message.sampleRate || this.sampleRate;
         break;
       case 'tts_end':
-        this.clearFinishWatchdog();
-        this.finishTimeline();
+        // The relay only sends this once the context is closed, so no more audio
+        // is coming. Play out what is queued rather than cutting it off.
+        this.beginFinish();
         break;
       case 'tts_error':
         this.errors.emit(message.message);
@@ -180,36 +198,8 @@ export class SpeechPlayer {
       const s = view[i]!;
       samples[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
     }
-    this.chunks.push(samples);
-    this.available += samples.length;
-    this.drain();
-  }
-
-  private drain(): void {
-    while (this.available >= FRAME_SAMPLES) {
-      const frame = this.take(FRAME_SAMPLES);
-      this.schedule(frame);
-    }
-  }
-
-  private take(count: number): Float32Array {
-    const out = new Float32Array(count);
-    let written = 0;
-    while (written < count && this.chunks.length) {
-      const head = this.chunks[0]!;
-      const need = count - written;
-      if (head.length <= need) {
-        out.set(head, written);
-        written += head.length;
-        this.chunks.shift();
-      } else {
-        out.set(head.subarray(0, need), written);
-        this.chunks[0] = head.subarray(need);
-        written += need;
-      }
-    }
-    this.available -= written;
-    return out;
+    this.lastAudioAt = Date.now();
+    this.schedule(samples);
   }
 
   private schedule(samples: Float32Array): void {
@@ -230,17 +220,8 @@ export class SpeechPlayer {
     this.live++;
     node.onended = () => {
       this.live--;
-      if (this.live <= 0 && this.available < FRAME_SAMPLES) this.setActive(false);
+      this.maybeEnd();
     };
-  }
-
-  /** Flush the sub-frame tail and let playback drain. */
-  private finishTimeline(): void {
-    if (this.available > 0) {
-      this.schedule(this.take(this.available));
-      this.available = 0;
-    }
-    if (this.live === 0) this.setActive(false);
   }
 
   private getAudioContext(): AudioContext {

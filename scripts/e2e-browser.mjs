@@ -17,12 +17,26 @@ const PORT = Number(process.env.CDP_PORT ?? 9333);
 const HOST = process.env.HOST ?? 'localhost:12000';
 
 /** Synthesize a phrase as a 16 kHz mono WAV, plus a second of silence so a
- *  restart is detectable, using the app's own TTS relay. */
+ *  restart is detectable, using the app's own TTS relay.
+ *
+ *  The relay's `tts_end` means "the context is closed", not "all audio has been
+ *  delivered" — the provider offers no frame for the latter. So the fixture
+ *  collects frames until they stop arriving, rather than trusting that signal. */
 async function makeWav(text, out = WAV) {
   if (existsSync(out) && process.env.WAV) return; // caller supplied one
   const ws = new WebSocket(`ws://${HOST}/api/tts`);
   const parts = [];
   await new Promise((resolve, reject) => {
+    let sawAudio = false;
+    let quiet = null;
+    const settle = () => {
+      if (!sawAudio) return;
+      clearTimeout(quiet);
+      quiet = setTimeout(() => {
+        clearTimeout(timer);
+        resolve();
+      }, 700);
+    };
     const timer = setTimeout(() => reject(new Error('synth timeout')), 20000);
     ws.on('open', () => {
       ws.send(JSON.stringify({ type: 'tts_start', sampleRate: 16000 }));
@@ -32,16 +46,15 @@ async function makeWav(text, out = WAV) {
     ws.on('message', (raw, isBinary) => {
       if (isBinary) {
         parts.push(raw);
+        sawAudio = true;
+        settle();
         return;
       }
       const m = JSON.parse(raw.toString());
       if (m.type === 'tts_error') {
         clearTimeout(timer);
+        clearTimeout(quiet);
         reject(new Error(m.message));
-      }
-      if (m.type === 'tts_end') {
-        clearTimeout(timer);
-        resolve();
       }
     });
     ws.on('error', reject);
@@ -156,7 +169,12 @@ await send('Page.enable');
 
 /* Replace the microphone with a WAV played through Web Audio, before the app
    module runs. The app caches the mic stream across turns, so the capture graph
-   is created once and `__playMic` re-feeds it from the currently staged WAV. */
+   is created once and `__playMic` re-feeds it from the currently staged WAV.
+
+   Also tap the playback path: patch `AudioNode.connect` so anything the app
+   routes to the speakers is mirrored into an analyser we can sample. Headless
+   Chromium does run its audio graph, so this is a real check that sound is
+   produced, not a proxy for it. */
 await send('Page.addScriptToEvaluateOnNewDocument', {
   source: `(() => {
     const ctx = new AudioContext();
@@ -179,6 +197,46 @@ await send('Page.addScriptToEvaluateOnNewDocument', {
       await ctx.resume();
       return dest.stream;
     };
+
+    // Count what the page puts on the STT socket, and how the mic graph is doing.
+    window.__sent = { audioBytes: 0, control: [] };
+    const send = WebSocket.prototype.send;
+    WebSocket.prototype.send = function (data) {
+      try {
+        if (this.url.includes('/api/stt')) {
+          if (typeof data === 'string') window.__sent.control.push(data);
+          else window.__sent.audioBytes += data.byteLength ?? data.length ?? 0;
+        }
+      } catch {}
+      return send.call(this, data);
+    };
+
+    // --- output tap ---
+    window.__probe = null;
+    const connect = AudioNode.prototype.connect;
+    AudioNode.prototype.connect = function (target, ...rest) {
+      const out = connect.call(this, target, ...rest);
+      try {
+        if (target instanceof AudioDestinationNode) {
+          if (!window.__probe) {
+            window.__probe = target.context.createAnalyser();
+            window.__probe.fftSize = 2048;
+          }
+          connect.call(this, window.__probe);
+        }
+      } catch {}
+      return out;
+    };
+    window.__peaks = [];
+    window.__peakTimer = setInterval(() => {
+      const an = window.__probe;
+      if (!an) return;
+      const arr = new Float32Array(an.fftSize);
+      an.getFloatTimeDomainData(arr);
+      let p = 0;
+      for (const v of arr) { const a = Math.abs(v); if (a > p) p = a; }
+      window.__peaks.push(+p.toFixed(4));
+    }, 100);
   })();`,
 });
 
@@ -195,7 +253,8 @@ for (const ev of events) {
 }
 
 /* One full turn: hold the button, release, wait for the reply and for the UI to
-   settle back to Ready. Defined in the page so each call is a plain round trip. */
+   settle back to Ready. Timestamps each visible stage with performance.now() so
+   the reported latencies are the app's real ones, not a proxy. */
 await evaluate(`(() => {
   const el = (s) => document.querySelector(s);
   window.__turn = async (holdMs) => {
@@ -208,14 +267,38 @@ await evaluate(`(() => {
 
     const seen = [];
     const watch = setInterval(() => seen.push(status.textContent), 200);
-    await window.__playMic();
+    window.__peaks.length = 0;
+    window.__sent = { audioBytes: 0, control: [] };
+
+    // Sample the DOM fast enough to timestamp each stage, and remember the
+    // release instant so every number below is relative to it.
+    const marks = { partial: null, thinking: null, firstToken: null, speaking: null };
+    let releasedAt = null;
+    const poll = setInterval(() => {
+      const st = status.textContent;
+      const tr = el('#transcript').textContent.trim();
+      const ans = el('#answer').textContent.trim();
+      if (marks.partial === null && tr) marks.partial = performance.now();
+      if (marks.thinking === null && st.includes('Thinking')) marks.thinking = performance.now();
+      if (marks.firstToken === null && ans) marks.firstToken = performance.now();
+      if (marks.speaking === null && st.includes('Speaking')) marks.speaking = performance.now();
+    }, 10);
+
     press('pointerdown');
+    // Start feeding the fake mic only once the app has built its capture graph;
+    // audio played into a graph that does not exist yet is simply lost. The app
+    // flips its state to "recording" when the graph is live.
+    for (let i = 0; i < 100 && talk.dataset.state !== 'recording'; i++) {
+      await sleep(20);
+    }
+    await window.__playMic();
     let peak = 0;
     const meter = setInterval(() => {
       const v = parseFloat(getComputedStyle(el('#meter')).getPropertyValue('--level')) || 0;
       if (v > peak) peak = v;
     }, 100);
     await sleep(holdMs);
+    releasedAt = performance.now();
     press('pointerup');
     clearInterval(meter);
 
@@ -234,12 +317,25 @@ await evaluate(`(() => {
       await sleep(200);
     }
     clearInterval(watch);
+    clearInterval(poll);
+
+    const rel = (t) => (t === null ? null : Math.round(t - releasedAt));
     return {
       transcript: el('#transcript').textContent.trim(),
       answer,
       status: status.textContent,
       peak,
+      sent: window.__sent,
+      audioPeak: Math.max(0, ...window.__peaks),
+      audioActiveSamples: window.__peaks.filter((p) => p > 0.01).length,
+      peaks: window.__peaks,
       states: [...new Set(seen)],
+      timing: {
+        partial: rel(marks.partial),
+        thinking: rel(marks.thinking),
+        firstToken: rel(marks.firstToken),
+        speaking: rel(marks.speaking),
+      },
     };
   };
 })()`);
@@ -255,11 +351,20 @@ for (const turn of turns) {
   results.push(r);
   console.log(`\n${turn.label}`);
   console.log('  transcript:', JSON.stringify(r.transcript));
-  console.log('  answer:    ', JSON.stringify(r.answer));
-  console.log('  final:     ', JSON.stringify(r.status));
-  console.log('  mic peak:  ', r.peak);
+  console.log('  status:    ', JSON.stringify(r.status));
+  console.log('  mic peak:  ', r.peak, '| audio sent:', r.sent.audioBytes, 'bytes');
+  console.log('  audio peak:', r.audioPeak, '| active samples:', r.audioActiveSamples);
+  console.log('  envelope:  ', (r.peaks ?? []).join(','));
+  console.log('  timing:    ', JSON.stringify(r.timing));
   console.log('  states:    ', (r.states ?? []).join(' | '));
   ok &&= Boolean(r.transcript) && Boolean(r.answer) && /Ready/.test(r.status ?? '');
+  // Real audio must reach the output, not just the `speaking` state, and the
+  // mic must actually have been on the wire.
+  ok &&= r.audioPeak > 0.01;
+  ok &&= r.sent.audioBytes > 16000;
+  // The turn must not end before the button is released: every stage timestamp
+  // is relative to release, so a negative value means it started too early.
+  ok &&= r.timing.speaking === null || r.timing.speaking >= 0;
 }
 
 console.log(ok ? '\nE2E PASS' : '\nE2E FAIL');
