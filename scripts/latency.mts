@@ -81,8 +81,9 @@ async function measure(question) {
   }
   tts.send(JSON.stringify({ type: 'tts_finish' }));
 
-  // Wait for the final audio frame.
-  for (let i = 0; i < 60 && marks.end === null; i++) await sleep(50);
+  // Wait for the terminal frame. It can trail the last audio frame by several
+  // seconds, so allow generously and report "n/a" rather than a bare null.
+  for (let i = 0; i < 200 && marks.end === null; i++) await sleep(50);
   tts.close();
 
   return { question, marks, text: text.trim(), fragments, sampleRate, audioSeconds: audioBytes / 2 / sampleRate };
@@ -93,7 +94,7 @@ for (const q of questions) {
   const r = await measure(q);
   rows.push(r);
   console.log(
-    `"${r.text}"\n   TTFT ${r.marks.token}ms | first-fragment ${r.marks.fragment}ms | first-audio ${r.marks.audio}ms | complete ${r.marks.end}ms | ${r.fragments} frags, ${r.audioSeconds.toFixed(2)}s audio`,
+    `"${r.text}"\n   TTFT ${r.marks.token}ms | first-fragment ${r.marks.fragment}ms | first-audio ${r.marks.audio}ms | complete ${r.marks.end ?? 'n/a'}ms | ${r.fragments} frags, ${r.audioSeconds.toFixed(2)}s audio`,
   );
   await sleep(300);
 }

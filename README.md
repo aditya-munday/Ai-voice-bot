@@ -105,12 +105,14 @@ first), measured on this machine:
 
 | Stage | Typical |
 | --- | --- |
-| Release -> first Groq token | 90-150 ms |
-| Release -> first audio out of the speaker | 420-500 ms |
+| Release -> first Groq token | 140-230 ms |
+| Release -> first audio out of the speaker | 450-530 ms |
 
 The first turn is slower while the mic, audio graph, and provider sockets are
 opened; the page primes all of them on your first gesture so this is paid before
-you speak, not after you release.
+you speak, not after you release. The terminal `tts_end` frame is not part of
+this: it can trail the last audio frame by ~5 s, which is why nothing in the UI
+waits on it.
 
 ## Tests
 
