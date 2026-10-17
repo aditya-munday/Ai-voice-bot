@@ -39,7 +39,19 @@ All source is TypeScript.
     (keeps the socket open) and `{"type":"close_stream"}` to end a session.
   - TTS rejects the implicit `auto` language in some regions; send an explicit
     `language`. `lightning_v3.1` and `lightning_v3.1_pro` have separate voice
-    catalogs, so pair `voice_id` with the matching `model`.
+    catalogs, so pair `voice_id` with the matching `model`. A voice from the wrong
+    catalog fails with "Invalid input data", which reads like a malformed request
+    but actually means the voice is unknown to that model.
+  - Hindi TTS needs `lightning_v3.1_pro`. On `lightning_v3.1` the account returns
+    "Language 'hi' is not enabled in this region" for a voice that does exist, so
+    the pair is `lightning_v3.1_pro` + `meher`; do not switch the model without
+    re-checking Hindi.
+  - Language is a connect-time parameter on the persistent STT socket, so it
+    cannot switch per turn. Use `hi`, which is a superset rather than a Hindi-only
+    setting: it transcribes English as accurately as `en` does and also handles
+    Hindi, which `en` badly mangles. There is no `auto` value; the service rejects
+    it. TTS `hi` likewise speaks Devanagari, Latin Hinglish, and plain English, so
+    a single setting covers both languages and any script the model replies in.
   - Every TTS message of a context, including `context_close` and
     `cancel_request`, must repeat `voice_id`, `model`, `language`, and
     `sample_rate`. Omit one and the service validates that message as a fresh

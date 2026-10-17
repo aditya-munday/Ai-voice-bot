@@ -13,7 +13,7 @@ const check = (name, ok, detail = '') => {
 };
 
 /** Synthesize speech with smallest.ai, for feeding back into STT. */
-function synthesize(text) {
+function synthesize(text, language = 'en') {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket('wss://api.smallest.ai/waves/v1/tts/live', {
       headers: { authorization: `Bearer ${process.env.SMALLEST_API_KEY}` },
@@ -26,7 +26,7 @@ function synthesize(text) {
           text,
           voice_id: 'meher',
           model: 'lightning_v3.1_pro',
-          language: 'en',
+          language,
           sample_rate: 16000,
           complete_backoff_ms: 0,
         }),
@@ -90,25 +90,50 @@ async function testTts() {
 }
 
 /* ---- 2. Chat stream: tokens over SSE ---- */
-async function testChat() {
+
+/** Send one user message to the chat endpoint and return the streamed reply. */
+async function chat(content) {
   const res = await fetch(`http://${HOST}/api/chat`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ messages: [{ role: 'user', content: 'Reply with exactly one word: ready' }] }),
+    body: JSON.stringify({ messages: [{ role: 'user', content }] }),
   });
   const text = await res.text();
-  const tokens = text
+  return text
     .split('\n')
     .filter((l) => l.startsWith('data:'))
     .map((l) => l.slice(5).trim())
     .filter((p) => p.startsWith('{'))
     .map((p) => JSON.parse(p).token ?? '')
-    .join('');
-  check('chat: streamed reply', tokens.trim().length > 0, JSON.stringify(tokens.trim()));
+    .join('')
+    .trim();
+}
+
+async function testChat() {
+  const tokens = await chat('Reply with exactly one word: ready');
+  check('chat: streamed reply', tokens.length > 0, JSON.stringify(tokens));
+
+  // The whole multilingual feature rests on the model answering in the language
+  // it was asked in, so assert that rather than just "some text came back".
+  const hindi = await chat('मुझे बताओ कि server क्यों शुरू नहीं हो रहा');
+  const devanagari = (hindi.match(/[\u0900-\u097F]/g) ?? []).length;
+  check(
+    'chat: answers in hindi',
+    devanagari > 10,
+    `${devanagari} devanagari chars, ${JSON.stringify(hindi.slice(0, 70))}`,
+  );
 }
 
 /* ---- 3. STT relay: speech in, transcript out ---- */
-async function testStt() {
+
+/**
+ * Speak `phrase` into the STT relay and return the final transcript.
+ *
+ * The relay runs with language=hi, which is the superset setting: it transcribes
+ * English and Hindi alike, so both languages exercise the same code path the
+ * browser uses.
+ */
+async function transcribe(phrase, language) {
   const ws = new WebSocket(`ws://${HOST}/api/stt`);
   const finals = [];
   let ready = false;
@@ -120,7 +145,7 @@ async function testStt() {
   await new Promise((r) => ws.on('open', r));
   for (let i = 0; i < 100 && !ready; i++) await sleep(50);
 
-  const pcm = await synthesize('what is two plus two');
+  const pcm = await synthesize(phrase, language);
   // Pace the audio roughly in real time so the VAD sees natural speech.
   for (let i = 0; i < pcm.length; i += 4096) {
     ws.send(pcm.subarray(i, i + 4096));
@@ -137,11 +162,6 @@ async function testStt() {
   // flush that `finalize` triggers, or for a quiet gap if the provider had
   // already ended the utterance by itself; stopping at the first final loses the
   // word after a pause.
-  // The provider closes a segment on any pause, so a phrase can arrive as several
-  // finals and the last one is not necessarily the first to land. Wait for the
-  // flush that `finalize` triggers, or for a quiet gap if the provider had
-  // already ended the utterance by itself; stopping at the first final loses the
-  // word after a pause.
   for (let i = 0; i < 60; i++) {
     await sleep(100);
     const last = finals[finals.length - 1];
@@ -149,17 +169,27 @@ async function testStt() {
     if (last && Date.now() - last.at > 800) break;
   }
   ws.close();
+  return { ready, transcript: finals.map((f) => f.text).join(' ').trim() };
+}
 
-  const transcript = finals
-    .map((f) => f.text)
-    .join(' ')
-    .toLowerCase();
-  check('stt: ready handshake', ready);
+async function testStt() {
+  const english = await transcribe('what is two plus two', 'en');
+  check('stt: ready handshake', english.ready);
   // STT may render the numerals ("2 plus 2") or spell them out; both are correct.
   check(
     'stt: transcribed speech',
-    /what is (two|2) plus (two|2)/i.test(transcript),
-    JSON.stringify(transcript),
+    /what is (two|2) plus (two|2)/i.test(english.transcript),
+    JSON.stringify(english.transcript),
+  );
+
+  // The same session setting has to handle Hindi, since the language is fixed at
+  // connect time and cannot switch per turn. The script is either Devanagari or
+  // Roman, so accept either spelling of the keywords.
+  const hindi = await transcribe('सर्वर क्यों शुरू नहीं हो रहा है', 'hi');
+  check(
+    'stt: transcribed hindi speech',
+    /(सर्वर|server)/i.test(hindi.transcript) && /(क्यों|kyon|kyu)/i.test(hindi.transcript),
+    JSON.stringify(hindi.transcript),
   );
 }
 
