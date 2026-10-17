@@ -37,6 +37,15 @@ class PCM16Capture extends AudioWorkletProcessor {
     this.ratio = sampleRate / this.targetRate;
     this.chunkSamples = Math.max(1, Math.round(this.targetRate * 0.064));
     this.levelWindow = Math.round(sampleRate * 0.05);
+
+    this.port.onmessage = (event: MessageEvent) => {
+      // Button released: emit whatever is buffered below one chunk so the end of
+      // the last word is not clipped, then tell the page it may finalize.
+      if ((event.data as { type?: string })?.type === 'flush') {
+        if (this.pendingLen > 0) this.emit(this.take(this.pendingLen), true);
+        else this.port.postMessage({ type: 'flushed' });
+      }
+    };
   }
 
   private resample(input: Float32Array): Float32Array {
@@ -82,13 +91,13 @@ class PCM16Capture extends AudioWorkletProcessor {
     return written === count ? out : out.subarray(0, written);
   }
 
-  private emit(chunk: Float32Array): void {
+  private emit(chunk: Float32Array, last = false): void {
     const pcm = new Int16Array(chunk.length);
     for (let i = 0; i < chunk.length; i++) {
       const s = Math.max(-1, Math.min(1, chunk[i] ?? 0));
       pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
-    this.port.postMessage({ type: 'audio', pcm }, [pcm.buffer]);
+    this.port.postMessage({ type: 'audio', pcm, last }, [pcm.buffer]);
   }
 
   process(inputs: Float32Array[][]): boolean {

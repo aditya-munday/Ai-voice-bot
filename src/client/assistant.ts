@@ -1,13 +1,15 @@
 import { Emitter } from './events.js';
-import type { Recorder } from './recorder.js';
+import { SpeechSanitizer } from '../sanitize.js';
+import { Segmenter } from '../segment.js';
+import type { SpeechPlayer } from './speech.js';
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
 export type AssistantEvents = {
   user: string;
-  /** Streaming assistant text, appended incrementally. */
+  /** Raw model tokens, in order, for the on-screen transcript. */
   tokens: string;
-  /** A finished assistant reply (after TTS was queued). */
+  /** The finished assistant reply. */
   reply: string;
   speaking: boolean;
   error: string;
@@ -15,54 +17,47 @@ export type AssistantEvents = {
 
 /**
  * Orchestrates one conversational turn:
- *   final transcript -> Groq (streamed) -> sentence chunking -> smallest.ai TTS -> playback.
+ *   final transcript -> Groq (streamed) -> sanitize -> segment -> streaming TTS.
  *
- * TTS starts per sentence instead of per reply, so audio begins long before the
- * model has finished writing. A prefetch window keeps a couple of clips ready
- * ahead of the speaker so playback never starves.
+ * The reply is fed to the synthesizer as soon as each clause is complete, inside
+ * one synthesis context, so audio starts while the model is still writing and
+ * prosody still runs continuously across fragments.
  */
 export class Assistant {
-  user = new Emitter<string>();
-  tokens = new Emitter<string>();
-  reply = new Emitter<string>();
-  speaking = new Emitter<boolean>();
-  errors = new Emitter<string>();
+  readonly user = new Emitter<string>();
+  readonly tokens = new Emitter<string>();
+  readonly reply = new Emitter<string>();
+  readonly speaking = new Emitter<boolean>();
+  readonly errors = new Emitter<string>();
 
   private history: ChatMessage[] = [];
-  private queue: HTMLAudioElement[] = [];
-  private urls: string[] = [];
-  private playing = false;
-  private generation = 0;
   private controller: AbortController | null = null;
-  private ttsChain: Promise<void> = Promise.resolve();
+  private generation = 0;
+  private speakingNow = false;
 
-  constructor(private readonly recorder: Recorder) {
-    this.recorder.transcripts.on((event) => {
-      if (event.type === 'final') void this.respond(event.text);
+  constructor(private readonly speech: SpeechPlayer) {
+    this.speech.speaking.on((value) => {
+      this.speakingNow = value;
+      this.speaking.emit(value);
     });
+    this.speech.errors.on((message) => this.errors.emit(message));
   }
 
   get isBusy(): boolean {
-    return this.controller !== null || this.playing || this.queue.length > 0;
+    return this.controller !== null || this.speakingNow;
   }
 
-  /** Cancel the current turn: abort the model stream, drop audio, stop playback. */
+  /** Cancel the current turn: abort the model stream and stop all playback. */
   cancel(): void {
     this.generation++;
     this.controller?.abort();
     this.controller = null;
+    this.speech.cancel();
+  }
 
-    for (const audio of this.queue) {
-      audio.pause();
-      audio.src = '';
-    }
-    this.queue.length = 0;
-
-    for (const url of this.urls) URL.revokeObjectURL(url);
-    this.urls.length = 0;
-
-    this.playing = false;
-    this.speaking.emit(false);
+  /** Answer a final transcript. Safe to call fire-and-forget. */
+  async ask(text: string): Promise<void> {
+    return this.respond(text);
   }
 
   private async respond(text: string): Promise<void> {
@@ -71,25 +66,58 @@ export class Assistant {
 
     this.cancel();
     const generation = this.generation;
+
     const controller = new AbortController();
     this.controller = controller;
 
     this.user.emit(clean);
-    this.history.push({ role: 'user', content: clean });
 
-    let full = '';
+    // The user turn is not committed to history until the reply lands, so an
+    // aborted or failed turn cannot leave an unanswered user message behind.
+    const outgoing: ChatMessage[] = [...this.history, { role: 'user', content: clean }];
+
+    const sanitizer = new SpeechSanitizer();
+    const segmenter = new Segmenter();
+    const pending: string[] = [];
+    let raw = '';
     let buffer = '';
+    let started = false;
 
-    const flush = (sentence: string, final: boolean): void => {
-      const chunk = sentence.trim();
-      if (chunk) void this.enqueue(chunk, generation);
+    // Open the synthesis context immediately; it is usually ready before the
+    // first token, so the first clause can go straight out.
+    const begin = this.speech.begin().then(
+      () => {
+        if (generation !== this.generation) return;
+        started = true;
+        for (const fragment of pending) this.speech.push(fragment);
+        pending.length = 0;
+      },
+      (err: unknown) => {
+        if (generation === this.generation) {
+          this.errors.emit(err instanceof Error ? err.message : String(err));
+        }
+      },
+    );
+
+    /** Hand finished fragments to the synthesizer, or hold until it is ready. */
+    const speak = (fragments: string[]): void => {
+      for (const fragment of fragments) {
+        if (started) this.speech.push(fragment);
+        else pending.push(fragment);
+      }
+    };
+
+    /** Pull complete fragments out of `buffer`, keeping the incomplete tail. */
+    const segment = (final: boolean): void => {
+      speak(segmenter[final ? 'flush' : 'push'](buffer));
+      buffer = '';
     };
 
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: this.history }),
+        body: JSON.stringify({ messages: outgoing }),
         signal: controller.signal,
       });
 
@@ -116,46 +144,42 @@ export class Assistant {
           const payload = line.slice(5).trim();
           if (!payload || payload === '[DONE]') continue;
 
-          let token: string;
+          let parsed: { token?: string; error?: string };
           try {
-            token = (JSON.parse(payload) as { token?: string }).token ?? '';
+            parsed = JSON.parse(payload) as { token?: string; error?: string };
           } catch {
             continue;
           }
+          if (parsed.error) throw new Error(parsed.error);
+          const token = parsed.token;
           if (!token || generation !== this.generation) continue;
 
-          full += token;
-          buffer += token;
+          raw += token;
           this.tokens.emit(token);
-
-          let cut = -1;
-          const match = /[.!?…]\s|\n/.exec(buffer);
-          if (match) cut = match.index + (match[0].startsWith('\n') ? 0 : 1);
-          else if (buffer.length > 220) {
-            const space = buffer.lastIndexOf(' ', 200);
-            cut = space > 0 ? space : buffer.length;
-          }
-          if (cut > 0) {
-            flush(buffer.slice(0, cut), false);
-            buffer = buffer.slice(cut);
-          }
+          buffer += sanitizer.push(token);
+          segment(false);
         }
       }
 
-      flush(buffer, true);
-      full = full.trim();
+      buffer += sanitizer.flush();
+      segment(true);
 
+      await begin;
       if (generation !== this.generation) return;
 
-      if (full) {
-        this.history.push({ role: 'assistant', content: full });
+      this.speech.finish();
+
+      const reply = raw.trim();
+      if (reply) {
+        this.history = [...outgoing, { role: 'assistant', content: reply }];
         this.trimHistory();
-        this.reply.emit(full);
+        this.reply.emit(reply);
       }
     } catch (err) {
-      if (generation === this.generation && !(err instanceof DOMException && err.name === 'AbortError')) {
-        this.errors.emit(err instanceof Error ? err.message : String(err));
-      }
+      const aborted = err instanceof DOMException && err.name === 'AbortError';
+      if (generation !== this.generation) return;
+      this.speech.cancel();
+      if (!aborted) this.errors.emit(err instanceof Error ? err.message : String(err));
     } finally {
       if (generation === this.generation) this.controller = null;
     }
@@ -165,86 +189,5 @@ export class Assistant {
     const max = 16;
     if (this.history.length <= max) return;
     this.history = this.history.slice(-max);
-  }
-
-  /**
-   * Synthesize one chunk and push it onto the playback queue. Each request fires
-   * immediately (so TTS overlaps with model streaming), while a serial chain
-   * appends finished clips in sentence order.
-   */
-  private enqueue(text: string, generation: number): void {
-    const clip = this.fetchClip(text, this.controller?.signal);
-    const task = this.ttsChain.then(async () => {
-      const blob = await clip;
-      if (!blob || generation !== this.generation) return;
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audio.preload = 'auto';
-      this.urls.push(url);
-      this.queue.push(audio);
-      this.hydrate();
-    });
-    this.ttsChain = task;
-  }
-
-  private async fetchClip(text: string, signal?: AbortSignal): Promise<Blob | null> {
-    try {
-      const response = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text }),
-        signal,
-      });
-      if (!response.ok) throw new Error(`voice request failed (${response.status})`);
-      return await response.blob();
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') return null;
-      this.errors.emit(err instanceof Error ? err.message : String(err));
-      return null;
-    }
-  }
-
-  /** play(), pause() or resume() every queued clip so they share one timeline. */
-  private hydrate(): void {
-    for (const audio of this.queue) {
-      if (audio.paused) {
-        audio.play().catch(() => undefined);
-      }
-    }
-    if (!this.playing && this.queue.length) {
-      this.playing = true;
-      this.speaking.emit(true);
-    }
-  }
-
-  /** Drop clips whose audio has already been consumed. */
-  private prune(): void {
-    while (this.queue.length) {
-      const audio = this.queue[0];
-      if (!audio) break;
-      if (!audio.ended && !(audio.paused && audio.currentTime >= audio.duration)) break;
-
-      const url = audio.src;
-      this.queue.shift();
-      audio.pause();
-      audio.removeAttribute('src');
-      for (let i = this.urls.length - 1; i >= 0; i--) {
-        const candidate = this.urls[i];
-        if (candidate === url) {
-          URL.revokeObjectURL(candidate);
-          this.urls.splice(i, 1);
-        }
-      }
-
-      if (this.playing && this.queue.length === 0) {
-        this.playing = false;
-        this.speaking.emit(false);
-      }
-    }
-  }
-
-  /** Called on a timer from the page to keep the queue tidy. */
-  tick(): void {
-    this.prune();
   }
 }

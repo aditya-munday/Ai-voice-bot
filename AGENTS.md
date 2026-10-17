@@ -39,13 +39,76 @@ All source is TypeScript.
     (keeps the socket open) and `{"type":"close_stream"}` to end a session.
   - TTS rejects the implicit `auto` language in some regions; send an explicit
     `language`. `lightning_v3.1` and `lightning_v3.1_pro` have separate voice
-    catalogs, so pair `voice_id` with the matching `model`.
+    catalogs, so pair `voice_id` with the matching `model`. A voice from the wrong
+    catalog fails with "Invalid input data", which reads like a malformed request
+    but actually means the voice is unknown to that model.
+  - Hindi TTS needs `lightning_v3.1_pro`. On `lightning_v3.1` the account returns
+    "Language 'hi' is not enabled in this region" for a voice that does exist, so
+    the pair is `lightning_v3.1_pro` + `meher`; do not switch the model without
+    re-checking Hindi.
+  - Language is a connect-time parameter on the persistent STT socket, so it
+    cannot switch per turn. Use `hi`, which is a superset rather than a Hindi-only
+    setting: it transcribes English as accurately as `en` does and also handles
+    Hindi, which `en` badly mangles. There is no `auto` value; the service rejects
+    it. TTS `hi` likewise speaks Devanagari, Latin Hinglish, and plain English, so
+    a single setting covers both languages and any script the model replies in.
+  - Every TTS message of a context, including `context_close` and
+    `cancel_request`, must repeat `voice_id`, `model`, `language`, and
+    `sample_rate`. Omit one and the service validates that message as a fresh
+    request and fails with a misleading "language not enabled" error, killing
+    the context before any audio is produced. See `base()` in `src/server.ts`.
+  - TTS has no frame that means "this context is fully done". It emits `complete`
+    after *every* fragment it releases, not once per context, so forwarding it as
+    the end of the turn stops playback mid-reply. The relay therefore sends
+    `tts_end` only when the client itself closes the context
+    (`context_close`), and the player then ends the turn from real state: text
+    complete, all scheduled buffers ended, and a short quiet window elapsed.
+  - STT emits its own `is_final` after any pause, mid-hold. Treating that as the
+    end of the user's turn answers people while they are still speaking and
+    starts a second turn on release. `recorder.ts` accumulates those finals;
+    only the button release commits the turn.
+  - That same pause-splitting is why the release must wait for `finalize` to
+    answer. The provider punctuates each fragment as a sentence ("What is?
+    Polymorphism.") and, worse, its running partial can be a few characters short
+    of the word it is still holding ("Polymor" for "Polymorphism"). `finalize`
+    forces an immediate flush — measured ~140 ms, against ~550 ms for the
+    provider's own end-of-utterance final — and the flushed final carries the
+    whole word. Committing on a short fixed timer instead races that flush and
+    non-deterministically drops the segment after the pause, so the model answers
+    only the first half of the question. See `finalize()` in `recorder.ts`.
+  - The provider drops the last word when the audio stops dead on it, so a turn
+    ends with ~420 ms of silence padded onto the socket before `finalize`. See
+    `padSilence()` in `recorder.ts` and `scripts/probe-stt-tail.mjs`.
+  - Not every pause splits a segment, so a dropped tail looks intermittent.
+- The first press is slower than later ones: it opens the mic and fetches and
+  compiles the worklet. `recorder.preload()` starts the worklet at page load, and
+  `ensureStream()` shares one `getUserMedia` between `prime()` and `start()` —
+  both run on the same first gesture, and two calls mean two prompts. A release
+  that lands while the graph is still being built cancels the start via the `turn`
+  counter; `stop()` must not be gated on `recording` or that release is dropped
+  and the microphone stays open.
 - Groq model availability is account-specific. `openai/gpt-oss-20b` is the fast
   default here; `llama-3.1-8b-instant` is not enabled on every account.
 
 ## Testing
 
-There is no automated test suite. Verify changes against the live providers:
+`scripts/smoke.mjs` (`npm test`) checks all three legs against the live providers:
+it synthesizes speech, feeds it through the STT relay, and asserts a transcript
+comes back. `scripts/e2e-browser.mjs` (`npm run test:e2e`) drives the real page in
+headless Chromium with a synthesized microphone and asserts the whole turn. Pass
+a phrase containing `|` to speak it with a pause between the parts, e.g.
+`PHRASE="what is|polymorphism" npm run test:e2e`, which exercises the
+pause-split path above; the harness then asserts text arrived beyond the first
+part. It does not assert exact spelling, since the recognizer legitimately
+mishears a word now and then.
+`scripts/latency.mts` (`npm run latency`) measures release-to-first-audio and is
+the tool to use when judging a latency change. `scripts/latency-e2e.mjs` does the
+same inside the real page and prints a per-stage breakdown (transcript commit,
+first token, first audio); `scripts/probe-contracts.mjs` records the raw provider
+frames so the assumptions above can be re-checked rather than trusted. All need
+the server running.
+
+For a manual check:
 
 ```bash
 npm run build && npm start
@@ -53,9 +116,21 @@ curl -s localhost:12000/api/health
 curl -s -N -X POST localhost:12000/api/chat \
   -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"hello"}]}'
-curl -s -o /tmp/out.wav -X POST localhost:12000/api/tts \
-  -H 'content-type: application/json' -d '{"text":"hello"}'
 ```
 
-For the STT relay, stream 16 kHz linear16 PCM to `ws://localhost:12000/api/stt`
-and send `{"type":"finalize"}`; expect `is_final: true` in a transcript event.
+The TTS path is a WebSocket now, not a POST: connect to `ws://localhost:12000/api/tts`
+and send `{"type":"tts_start","sampleRate":16000}`, `{"type":"tts_text","text":"..."}`,
+then `{"type":"tts_finish"}`; expect `tts_ready`, binary PCM frames, then `tts_end`.
+
+Two things to know when working on the browser test or the player:
+
+- Headless Chromium has no audio sink, so `AudioContext.currentTime` never
+  advances. Anything that decides "playback finished" by polling that clock will
+  hang forever there (and on a real machine it is still a fine way to get stuck
+  if the device stalls). `SpeechPlayer` therefore ends a turn from
+  `BufferSource.onended` plus a quiet window since the last incoming frame — both
+  of which fire without a sink — rather than from the audio clock.
+- Chromium's `--use-file-for-fake-audio-capture` device frequently delivers
+  silence in headless. `scripts/e2e-browser.mjs` instead overrides
+  `navigator.mediaDevices.getUserMedia` to return a `MediaStreamAudioDestinationNode`
+  fed by a decoded WAV, which is deterministic.
