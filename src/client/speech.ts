@@ -29,6 +29,14 @@ const QUIET_MS = 350;
 export class SpeechPlayer {
   readonly speaking = new Emitter<boolean>();
   readonly errors = new Emitter<string>();
+  /** First PCM frame of the current context arrived. Fires once per context. */
+  readonly firstFrame = new Emitter<void>();
+  /** Audio actually started sounding for the current context. Once per context. */
+  readonly firstPlayed = new Emitter<void>();
+
+  private sawFrame = false;
+  private sawPlayed = false;
+  private playTimer: ReturnType<typeof setTimeout> | null = null;
 
   private socket: WebSocket | null = null;
   private opened: Promise<void> | null = null;
@@ -107,6 +115,10 @@ export class SpeechPlayer {
     this.live = 0;
     this.textDone = false;
     this.lastAudioAt = Date.now();
+    this.sawFrame = false;
+    this.sawPlayed = false;
+    if (this.playTimer) clearTimeout(this.playTimer);
+    this.playTimer = null;
   }
 
   /* ---------------------------------------------------------------- *
@@ -199,6 +211,10 @@ export class SpeechPlayer {
       samples[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
     }
     this.lastAudioAt = Date.now();
+    if (!this.sawFrame) {
+      this.sawFrame = true;
+      this.firstFrame.emit();
+    }
     this.schedule(samples);
   }
 
@@ -215,9 +231,18 @@ export class SpeechPlayer {
     buffer.getChannelData(0).set(samples);
     node.buffer = buffer;
     node.connect(context.destination);
-    node.start(this.scheduledUntil);
+    const startAt = this.scheduledUntil;
+    node.start(startAt);
     this.scheduledUntil += duration;
     this.live++;
+    // Approximate "audio is audible now" from the audio clock. In headless Chromium
+    // there is no sink and currentTime never advances, so this is a debug mark, not
+    // a gate: nothing in the turn path waits on it.
+    if (!this.sawPlayed) {
+      this.sawPlayed = true;
+      const delayMs = Math.max(0, (startAt - now) * 1000);
+      this.playTimer = setTimeout(() => this.firstPlayed.emit(), delayMs);
+    }
     node.onended = () => {
       this.live--;
       this.maybeEnd();

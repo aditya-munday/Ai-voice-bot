@@ -1,6 +1,7 @@
 import { Emitter } from './events.js';
 import { SpeechSanitizer } from '../sanitize.js';
 import { Segmenter } from '../segment.js';
+import { TurnTracer, newTurnId, postTrace, type TurnTrace } from '../trace.js';
 import type { SpeechPlayer } from './speech.js';
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
@@ -29,11 +30,17 @@ export class Assistant {
   readonly reply = new Emitter<string>();
   readonly speaking = new Emitter<boolean>();
   readonly errors = new Emitter<string>();
+  /** Emitted with the finished trace when a turn completes. */
+  readonly traced = new Emitter<TurnTrace>();
 
   private history: ChatMessage[] = [];
   private controller: AbortController | null = null;
   private generation = 0;
   private speakingNow = false;
+  /** Open tracer for the turn in flight, so the player's marks can reach it. */
+  private tracer: TurnTracer | null = null;
+  /** Set by the caller just before `ask`, so `release` is stamped correctly. */
+  private releaseAt = 0;
 
   constructor(private readonly speech: SpeechPlayer) {
     this.speech.speaking.on((value) => {
@@ -41,6 +48,17 @@ export class Assistant {
       this.speaking.emit(value);
     });
     this.speech.errors.on((message) => this.errors.emit(message));
+    this.speech.firstFrame.on(() => this.tracer?.mark('first_audio_frame'));
+    this.speech.firstPlayed.on(() => this.tracer?.mark('first_audio_played'));
+  }
+
+  /**
+   * Stamp the release for the next turn. The recorder calls this the moment the
+   * button comes up, before the provider has finalized, because the user's own
+   * release is the start of the latency the user actually feels.
+   */
+  markRelease(at: number = Date.now()): void {
+    this.releaseAt = at;
   }
 
   get isBusy(): boolean {
@@ -66,6 +84,16 @@ export class Assistant {
 
     this.cancel();
     const generation = this.generation;
+
+    // The release mark is the user's button-up. `releaseAt` is set by the caller
+    // when it knows that moment; otherwise the transcript arriving is the best
+    // proxy we have, which slightly understates the turn.
+    const t0 = this.releaseAt || Date.now();
+    const tracer = new TurnTracer(newTurnId(), t0);
+    tracer.mark('release');
+    tracer.mark('stt_final');
+    tracer.setTranscript(clean);
+    this.tracer = tracer;
 
     const controller = new AbortController();
     this.controller = controller;
@@ -102,6 +130,7 @@ export class Assistant {
     /** Hand finished fragments to the synthesizer, or hold until it is ready. */
     const speak = (fragments: string[]): void => {
       for (const fragment of fragments) {
+        tracer.mark('first_fragment_sent');
         if (started) this.speech.push(fragment);
         else pending.push(fragment);
       }
@@ -114,10 +143,15 @@ export class Assistant {
     };
 
     try {
+      tracer.mark('llm_request');
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ messages: outgoing }),
+        body: JSON.stringify({
+          messages: outgoing,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          locale: navigator.language,
+        }),
         signal: controller.signal,
       });
 
@@ -155,6 +189,7 @@ export class Assistant {
           if (!token || generation !== this.generation) continue;
 
           raw += token;
+          tracer.mark('first_token');
           this.tokens.emit(token);
           buffer += sanitizer.push(token);
           segment(false);
@@ -175,14 +210,35 @@ export class Assistant {
         this.trimHistory();
         this.reply.emit(reply);
       }
+      this.finishTrace(tracer);
     } catch (err) {
       const aborted = err instanceof DOMException && err.name === 'AbortError';
-      if (generation !== this.generation) return;
+      if (generation !== this.generation) {
+        // Superseded by a newer turn: the new turn owns the marks now, so this
+        // one is dropped rather than shipped with a misleading partial timeline.
+        return;
+      }
       this.speech.cancel();
-      if (!aborted) this.errors.emit(err instanceof Error ? err.message : String(err));
+      if (!aborted) {
+        const message = err instanceof Error ? err.message : String(err);
+        tracer.setError(message);
+        this.errors.emit(message);
+      } else {
+        tracer.setError('aborted');
+      }
+      this.finishTrace(tracer);
     } finally {
       if (generation === this.generation) this.controller = null;
     }
+  }
+
+  /** Stamp `turn_end`, emit the trace, and clear it from the active slot. */
+  private finishTrace(tracer: TurnTracer): void {
+    tracer.mark('turn_end');
+    const trace = tracer.snapshot();
+    if (this.tracer === tracer) this.tracer = null;
+    this.traced.emit(trace);
+    void postTrace(trace);
   }
 
   private trimHistory(): void {
