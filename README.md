@@ -16,6 +16,11 @@ Hindi selected, which transcribes English just as accurately, and the reply come
 back in whichever language you used. Hindi answers are spoken correctly whether
 the model writes Devanagari or Roman Hinglish.
 
+The assistant is deliberately foul-mouthed: it is tuned as a blunt, funny friend
+rather than a corporate helper, and it swears in the language you are speaking.
+Edit the built-in prompt in `src/config.ts`, or set `SYSTEM_PROMPT`, if you want a
+polite assistant instead.
+
 ## Quick start
 
 ```bash
