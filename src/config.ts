@@ -147,6 +147,15 @@ export const config = {
   // sentence boundary. Short, because our fragments are already sentence-shaped.
   ttsMaxBufferDelayMs: num(process.env.SMALLEST_TTS_MAX_BUFFER_DELAY_MS, 250),
 
+  // How long to keep the relay's end-of-turn open after `context_close`. The
+  // provider keeps sending audio after the close, so `tts_end` waits for its
+  // `complete` and for this quiet window with no new chunk, and gives up at the
+  // grace deadline. Measured: a five second utterance finishes its audio at
+  // about 1.2s but only reports `complete` at about 5.1s, so a grace shorter
+  // than that truncates replies.
+  ttsQuietMs: num(process.env.SMALLEST_TTS_QUIET_MS, 400),
+  ttsCloseGraceMs: num(process.env.SMALLEST_TTS_CLOSE_GRACE_MS, 8000),
+
   // Measured, not assumed: see the benchmark table in AGENTS.md. qwen is the
   // fastest compliant model here (TTFT p50 264ms over 6 probes, 100% prompt
   // compliance and correctness), and it supports tool calling with no preamble

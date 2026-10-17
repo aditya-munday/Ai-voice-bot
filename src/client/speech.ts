@@ -48,6 +48,14 @@ export class SpeechPlayer {
   private live = 0;
   private active = false;
   private generation = 0;
+  /**
+   * Generation of the context currently open. The relay ends a turn late on
+   * purpose, once the provider has released the context, so an `tts_end` for the
+   * previous turn can arrive after the next one has already begun. Acting on it
+   * would end the new turn before it spoke, so control messages are ignored
+   * unless they belong to the context this player is on.
+   */
+  private openGeneration = -1;
 
   /**
    * End-of-turn tracking. `tts_end` means "the context is closed", which is *not*
@@ -73,6 +81,7 @@ export class SpeechPlayer {
 
     this.resetTimeline();
     this.setActive(true);
+    this.openGeneration = generation;
     // 0 = "use the server's configured rate"; the relay echoes it in `tts_ready`,
     // which is what the playback buffers are built with.
     this.socket.send(JSON.stringify({ type: 'tts_start', sampleRate: 0 }));
@@ -190,8 +199,12 @@ export class SpeechPlayer {
         this.sampleRate = message.sampleRate || this.sampleRate;
         break;
       case 'tts_end':
-        // The relay only sends this once the context is closed, so no more audio
-        // is coming. Play out what is queued rather than cutting it off.
+        // Belongs to a context this player is no longer on: a late end for the
+        // previous turn, arriving after a new one began.
+        if (this.openGeneration !== this.generation) break;
+        // The relay only sends this once the provider has released the context,
+        // so no more audio is coming. Play out what is queued rather than cutting
+        // it off.
         this.beginFinish();
         break;
       case 'tts_error':

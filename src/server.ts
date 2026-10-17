@@ -251,6 +251,44 @@ const attachTtsRelay = (server: http.Server): void => {
     const queued: TtsClientMessage[] = [];
 
     /**
+     * End-of-turn tracking.
+     *
+     * The provider keeps delivering audio for a context for seconds after the
+     * text is closed, so `tts_end` must not be sent when the client asks to
+     * close. Measured on a five second utterance: the last audio chunk arrives
+     * at about 1.2s and the provider's `complete` at about 5.1s. A page that
+     * trusts an early `tts_end` stops the player and the reply is cut off mid
+     * sentence, which is why most turns produced no audible audio at all.
+     *
+     * So after `context_close` we wait for the provider's `complete` for that
+     * context, then for a short quiet window in case chunks trail it, and only
+     * then signal the end. `closeDeadline` is the fallback for a provider that
+     * never sends `complete`.
+     */
+    let closing = false;
+    let providerDone = false;
+    let lastAudioAt = 0;
+    let closeDeadline = 0;
+    let closeWatchdog: ReturnType<typeof setInterval> | null = null;
+    /**
+     * Whether audio from the provider still belongs to the context the page is
+     * playing. Binary frames carry no context id, so a cancelled context's
+     * in-flight chunks cannot be told apart from the new one's; dropping them
+     * until the next `tts_start` keeps a barge-in from leaking the previous
+     * reply's tail into the new turn.
+     */
+    let acceptingAudio = false;
+
+    const endContext = (): void => {
+      if (!closing) return;
+      closing = false;
+      contextId = null;
+      if (closeWatchdog) clearInterval(closeWatchdog);
+      closeWatchdog = null;
+      sendControl(client, { type: 'tts_end' } satisfies TtsServerMessage);
+    };
+
+    /**
      * Fields the service expects on *every* message of a context, including the
      * close and cancel. Omitting any of them makes the service validate that
      * message as a fresh request and fail (the failure surfaces as a misleading
@@ -271,6 +309,7 @@ const attachTtsRelay = (server: http.Server): void => {
               ? message.sampleRate
               : config.ttsSampleRate;
           contextId = `${session}-${++utterance}`;
+          acceptingAudio = true;
           // Acknowledge before any fragments so the page knows which rate it
           // will be scheduling, even if the first chunk lands in the same tick.
           sendControl(client, { type: 'tts_ready', sampleRate } satisfies TtsServerMessage);
@@ -292,16 +331,27 @@ const attachTtsRelay = (server: http.Server): void => {
         }
         case 'tts_finish': {
           if (!contextId) break;
-          upstream.send(JSON.stringify({ ...base(), context_id: contextId, context_close: true }));
-          contextId = null;
-          // The provider never marks a context as fully done, so this is the only
-          // reliable end-of-turn signal. Emit it after the close, when no further
-          // audio can be produced for this context.
-          sendControl(client, { type: 'tts_end' } satisfies TtsServerMessage);
+          const closingId = contextId;
+          upstream.send(JSON.stringify({ ...base(), context_id: closingId, context_close: true }));
+          // Do not end the turn here: the provider is still producing audio for
+          // this context. Wait for its `complete`, plus a quiet window, and fall
+          // back to a deadline in case it never arrives.
+          closing = true;
+          providerDone = false;
+          lastAudioAt = Date.now();
+          closeDeadline = Date.now() + config.ttsCloseGraceMs;
+          closeWatchdog = setInterval(() => {
+            const quiet = Date.now() - lastAudioAt >= config.ttsQuietMs;
+            if ((providerDone && quiet) || Date.now() >= closeDeadline) endContext();
+          }, 50);
           break;
         }
         case 'tts_cancel': {
           // Abandon whatever is buffered or mid-flight for this context.
+          if (closeWatchdog) clearInterval(closeWatchdog);
+          closeWatchdog = null;
+          closing = false;
+          acceptingAudio = false;
           upstream.send(
             JSON.stringify({
               ...base(),
@@ -328,7 +378,8 @@ const attachTtsRelay = (server: http.Server): void => {
         return;
       }
       if (parsed.status === 'chunk' && parsed.data?.audio) {
-        if (client.readyState === WebSocket.OPEN) {
+        lastAudioAt = Date.now();
+        if (acceptingAudio && client.readyState === WebSocket.OPEN) {
           client.send(Buffer.from(parsed.data.audio, 'base64'), { binary: true });
         }
         return;
@@ -337,7 +388,9 @@ const attachTtsRelay = (server: http.Server): void => {
         // The provider emits `complete` after every fragment it releases, not
         // once per context, so this cannot be forwarded as-is: the page would
         // treat a mid-reply release as the end of the turn and stop speaking.
-        // `tts_end` is sent only when the client itself closes the context.
+        // It is used only to confirm that a context we are closing has been
+        // fully released, together with the quiet window above.
+        providerDone = true;
         return;
       }
       if (parsed.status === 'error') {
@@ -375,6 +428,8 @@ const attachTtsRelay = (server: http.Server): void => {
 
     client.on('close', () => {
       clearInterval(ping);
+      if (closeWatchdog) clearInterval(closeWatchdog);
+      closeWatchdog = null;
       queued.length = 0;
       if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) {
         upstream.close();
