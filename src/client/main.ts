@@ -52,6 +52,8 @@ const stopListening = (): void => {
   // and building the capture graph, and a release during that window must still
   // end the turn. The recorder records the release and closes it when the graph
   // is live, so the button always responds.
+  // The release is also the start of the latency the user feels, so stamp it here.
+  assistant.markRelease();
   recorder.stop();
 };
 

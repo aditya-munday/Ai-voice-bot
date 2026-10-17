@@ -102,11 +102,46 @@ pause-split path above; the harness then asserts text arrived beyond the first
 part. It does not assert exact spelling, since the recognizer legitimately
 mishears a word now and then.
 `scripts/latency.mts` (`npm run latency`) measures release-to-first-audio and is
-the tool to use when judging a latency change. `scripts/latency-e2e.mjs` does the
+the tool to use when judging a latency change. It stamps the same `TurnTracer`
+marks the browser does, so its numbers and the live page's `/api/metrics` come
+from one source. Set `LANG=hi` for Hindi, `TURNS=n`, `GAP_MS=n` to pace turns.
+It treats a rate-limited or tokenless response as a failure and retries rather
+than recording it: an earlier version counted 429s as fast successes and
+produced a plausible but meaningless baseline. Check the `failed` count before
+believing any percentile. `scripts/latency-e2e.mjs` does the
 same inside the real page and prints a per-stage breakdown (transcript commit,
 first token, first audio); `scripts/probe-contracts.mjs` records the raw provider
 frames so the assumptions above can be re-checked rather than trusted. All need
 the server running.
+
+`npm run bench:models` compares Groq models on time to first token, prompt
+compliance (no banned symbols, no meta-talk), and correctness, per probe type.
+It reports a model whose daily quota is exhausted as unavailable rather than
+scoring it zero, because the account's token-per-day cap is **per model**.
+
+### Provider limits (measured)
+
+The Groq account is on the free tier and this is the binding constraint on every
+latency measurement:
+
+- **Tokens per day: 200,000, per model.** `openai/gpt-oss-20b` exhausts this
+  after roughly 120 turns and then 429s for the rest of the day; other models on
+  the same key keep working. Do not burn the day's quota on a latency run.
+- **Tokens per minute: 8,000.** The static prompt is ~1,700 tokens, so a burst of
+  turns mostly 429s. Space turns out and let the harness retry.
+- `whisper-large-v3-turbo` is available on this key, which is a candidate to
+  replace the smallest.ai STT leg if that path ever needs a fallback.
+
+Benchmark result (6 probes per model, free tier):
+
+| model | TTFT p50 | compliance | correctness | notes |
+|---|---|---|---|---|
+| `qwen/qwen3.8-27b` | 264ms | 100% | 100% | fastest; good Hinglish |
+| `openai/gpt-oss-120b` | 348ms | 100% | 100% | best depth on "why" answers |
+| `openai/gpt-oss-20b` | 333ms | 100% | 100% | fastest of the three in theory, but quota exhausts first |
+| `allam-2-7b` | 288ms | 75% | 50% | leaks "Assistant:" prefix, echoes the transcript back |
+
+So `qwen/qwen3.8-27b` is the measured default, not `gpt-oss-20b`.
 
 For a manual check:
 

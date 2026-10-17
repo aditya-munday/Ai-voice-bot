@@ -22,8 +22,9 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { config } from './config.js';
+import { config, buildContextMessage } from './config.js';
 import type { SttServerMessage, TtsClientMessage, TtsServerMessage } from './protocol.js';
+import { isValidTrace, summarize, type TurnTrace } from './trace.js';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const publicDir = join(here, '..', 'public');
@@ -39,7 +40,7 @@ const MIME: Record<string, string> = {
 };
 
 type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
-type ChatBody = { messages?: ChatMessage[] };
+type ChatBody = { messages?: ChatMessage[]; model?: string; timezone?: string; locale?: string; notes?: string };
 
 const readJson = async <T>(req: http.IncomingMessage): Promise<T> => {
   const chunks: Buffer[] = [];
@@ -57,9 +58,44 @@ const sendJson = (res: http.ServerResponse, status: number, body: unknown): void
   res.end(payload);
 };
 
+/**
+ * In-memory turn trace store for `/api/metrics`.
+ *
+ * Bounded ring: the last N turns. A ring, not an unbounded array, because this
+ * is a long-lived process and the only consumer wants recent percentiles. Traces
+ * carry no audio and only a truncated transcript.
+ */
+const traceStore: TurnTrace[] = [];
+const TRACE_LIMIT = 500;
+
+/** Structured one-line log per turn. No secrets, no audio, bounded transcript. */
+const recordTrace = (trace: TurnTrace): void => {
+  traceStore.push(trace);
+  if (traceStore.length > TRACE_LIMIT) traceStore.splice(0, traceStore.length - TRACE_LIMIT);
+  // One JSON object per line: greppable, and ingestible by any log shipper.
+  console.log(JSON.stringify({ event: 'turn', ...trace }));
+};
+
 /** Send a JSON control frame if the socket is still usable. */
 const sendControl = (socket: WebSocket, message: unknown): void => {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+};
+
+/* ------------------------------------------------------------------ *
+ * Turn traces: the browser posts one when a turn finishes. The server
+ * only stores and aggregates; it never re-derives a mark, because the
+ * marks are observations of the client's own clock.
+ * ------------------------------------------------------------------ */
+const handleTrace = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
+  let body: unknown;
+  try {
+    body = await readJson<unknown>(req);
+  } catch {
+    return sendJson(res, 400, { error: 'invalid json body' });
+  }
+  if (!isValidTrace(body)) return sendJson(res, 400, { error: 'invalid trace' });
+  recordTrace(body);
+  sendJson(res, 202, { ok: true });
 };
 
 /* ------------------------------------------------------------------ *
@@ -82,7 +118,20 @@ const handleChat = async (req: http.IncomingMessage, res: http.ServerResponse): 
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .slice(-config.historyTurns * 2);
 
-  const messages: ChatMessage[] = [{ role: 'system', content: config.systemPrompt }, ...trimmed];
+  const messages: ChatMessage[] = [
+    { role: 'system', content: config.systemPrompt },
+    // Second system message, after the cached prefix: the only place dynamic
+    // values live. Keeping it out of the static prompt is what lets the prefix
+    // above stay cacheable turn after turn.
+    { role: 'system', content: buildContextMessage(new Date(), { timezone: body.timezone, locale: body.locale, notes: body.notes }) },
+    ...trimmed,
+  ];
+
+  // Benchmarking needs to try other models without a restart. The value is
+  // checked against an allowlist so the endpoint cannot be steered to an
+  // arbitrary upstream model, and it defaults to the configured one.
+  const requested = typeof body.model === 'string' ? body.model : '';
+  const model = requested && config.groqAllowedModels.includes(requested) ? requested : config.groqModel;
 
   // A client disconnect cancels the upstream request instead of letting it run
   // to completion and burn tokens for nobody.
@@ -90,14 +139,14 @@ const handleChat = async (req: http.IncomingMessage, res: http.ServerResponse): 
   req.on('close', () => abort.abort());
 
   const payload: Record<string, unknown> = {
-    model: config.groqModel,
+    model,
     messages,
     stream: true,
     temperature: config.groqTemperature,
     max_tokens: config.groqMaxTokens,
   };
   // `reasoning_effort` is a gpt-oss parameter; other models reject it.
-  if (config.groqModel.includes('gpt-oss')) payload.reasoning_effort = config.groqReasoningEffort;
+  if (model.includes('gpt-oss')) payload.reasoning_effort = config.groqReasoningEffort;
 
   const upstream = await fetch(config.groqUrl, {
     method: 'POST',
@@ -458,6 +507,10 @@ const server = http.createServer((req, res) => {
   const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
   if (req.method === 'POST' && path === '/api/chat') return void handleChat(req, res);
+  if (req.method === 'POST' && path === '/api/trace') return void handleTrace(req, res);
+  if (req.method === 'GET' && path === '/api/metrics') {
+    return sendJson(res, 200, summarize(traceStore));
+  }
   if (req.method === 'GET' && path === '/api/health') {
     return sendJson(res, 200, {
       ok: true,
